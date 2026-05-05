@@ -95,10 +95,10 @@ class MiniWindow(QMainWindow):
     def apply_config_geometry(self, config):
         """JSONの設定を窓に反映させる"""
         self.setGeometry(
-            config.get("x", 960), 
-            config.get("y", 0), 
-            config.get("width", 480), 
-            config.get("height", 800)
+            config.get("x", 990), 
+            config.get("y", 28), 
+            config.get("width", 450), 
+            config.get("height", 830)
         )
 
     def _setup_browser(self):

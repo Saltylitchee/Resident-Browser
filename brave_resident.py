@@ -6,7 +6,7 @@ import time
 import keyboard
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-    QLineEdit, QStatusBar, QMainWindow, QLabel
+    QLineEdit, QPushButton, QStatusBar, QMainWindow, QLabel
 )
 from PyQt6.QtCore import (
     Qt, QUrl, QEvent, QTimer, QObject, pyqtSignal
@@ -28,7 +28,8 @@ DEFAULT_CONFIG = {
     "y": 25,
     "width": 450,
     "height": 830,
-    "url": "https://www.google.com"
+    "url": "https://www.google.com",
+    "favorites": ["https://www.youtube.com", "https://gemini.google.com/app"]
 }
 
 JS_COPY_SCRIPT = "window.getSelection().toString();"
@@ -64,7 +65,7 @@ class FloatingNotification(QWidget):
 class MiniWindow(QMainWindow):
     def __init__(self, config):
         super().__init__()
-        self.setWindowTitle("Brave Resident Mini")
+        self.setWindowTitle("Resident Mini")
         self.config_at_start = config
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self._setup_browser()
@@ -110,20 +111,129 @@ class MiniWindow(QMainWindow):
         
         self.search_container = QWidget()
         self.search_container.setStyleSheet("background: #f0f0f0; border-bottom: 1px solid #ccc;")
+        self.search_container.setMaximumHeight(40)
         s_layout = QHBoxLayout(self.search_container)
+        s_layout.setContentsMargins(5, 2, 5, 2)
+        s_layout.setSpacing(5)
+        s_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter) 
+
+        self.mode_toggle = QPushButton("[G]")
+        self.mode_toggle.setFixedSize(30, 24)
+        self.mode_toggle.setStyleSheet("background-color: #4285f4; color: white; font-weight: bold; border: none; border-radius: 3px;")
+        self.mode_toggle.clicked.connect(self.toggle_search_mode)
+        s_layout.addWidget(self.mode_toggle)
+
         self.search_bar = QLineEdit()
-        self.search_bar.setPlaceholderText("Search in page...")
+        self.search_bar.setPlaceholderText("Google Search...")
         self.search_bar.returnPressed.connect(self._handle_search_enter)
         s_layout.addWidget(self.search_bar)
+
+        # お気に入りグループ
+        self.fav_group = QWidget()
+        fav_layout = QHBoxLayout(self.fav_group)
+        fav_layout.setContentsMargins(0,0,0,0)
+        fav_layout.setSpacing(5)
+
+        config = load_config()
+        favs = config.get("favorites", DEFAULT_CONFIG.get("favorites", []))
+        
+        # アイコンURLの直接指定は不可なため、頭文字1文字をボタンにする
+        for url in favs[:2]:
+            display_text = url.replace("https://", "").replace("www.", "")[0].upper() # 頭文字
+            btn = QPushButton(display_text) 
+            btn.setFixedSize(24, 24)
+            btn.setToolTip(url) # ホバーでURLを表示
+            btn.setStyleSheet("background-color: white; border: 1px solid #ccc; border-radius: 3px; font-weight: bold;")
+            btn.clicked.connect(lambda checked, u=url: self.browser.setUrl(QUrl(u)))
+            fav_layout.addWidget(btn)
+        
+        s_layout.addWidget(self.fav_group)
+
+        # ページ内検索グループ
+        self.find_group = QWidget()
+        find_layout = QHBoxLayout(self.find_group)
+        find_layout.setContentsMargins(0,0,0,0)
+        find_layout.setSpacing(5)
+
+        self.hit_label = QLabel("0/0")
+        self.hit_label.setFixedWidth(40) # 幅を固定してガタつき防止
+        self.hit_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.hit_label.setStyleSheet("color: #666; font-size: 10px; font-weight: bold;")
+        find_layout.addWidget(self.hit_label)
+
+        btn_prev = QPushButton("↑")
+        btn_next = QPushButton("↓")
+        for b in [btn_prev, btn_next]: 
+            b.setFixedSize(24, 24)
+            b.setStyleSheet("background-color: white; border: 1px solid #ccc; border-radius: 3px;")
+        
+        btn_prev.clicked.connect(lambda: self._find_with_count(backward=True))
+        btn_next.clicked.connect(lambda: self._find_with_count(backward=False))
+        
+        find_layout.addWidget(btn_prev)
+        find_layout.addWidget(btn_next)
+        s_layout.addWidget(self.find_group)
+        self.find_group.hide()
+
         layout.addWidget(self.search_container)
         self.search_container.hide()
         
         layout.addWidget(self.browser)
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
+        self.search_mode = "google"
+        
+    def toggle_search_mode(self):
+        """トグルボタンでモードを切り替える"""
+        if self.search_mode == "google":
+            self.search_mode = "find"
+            self.mode_toggle.setText("[F]")
+            self.mode_toggle.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold; border-radius: 3px;")
+            self.search_bar.setPlaceholderText("Find in page...")
+            self.fav_group.hide()
+            self.find_group.show()
+        else:
+            self.search_mode = "google"
+            self.mode_toggle.setText("[G]")
+            self.mode_toggle.setStyleSheet("background-color: #4285f4; color: white; font-weight: bold; border-radius: 3px;")
+            self.search_bar.setPlaceholderText("Google Search...")
+            self.find_group.hide()
+            self.fav_group.show()
+        self.search_bar.setFocus()
+        
+    # --- 新設：ヒット件数を取得しながら検索する ---
+    def _find_with_count(self, backward=False):
+        text = self.search_bar.text()
+        flags = QWebEnginePage.FindFlag(0)
+        if backward:
+            flags |= QWebEnginePage.FindFlag.FindBackward
+        
+        # 検索実行時にコールバックを登録して件数を受け取る
+        self.browser.findText(text, flags, self._update_hit_count)
+
+    def _update_hit_count(self, result):
+        """検索結果（件数情報）をラベルに反映"""
+        # [修正] 環境に合わせて activeMatch() を使用
+        num_matches = result.numberOfMatches() 
+        active_index = result.activeMatch() # activeMatchIndex から activeMatch へ変更
+
+        if num_matches > 0:
+            current = active_index
+            self.hit_label.setText(f"{current}/{num_matches}")
+        else:
+            self.hit_label.setText("0/0")
 
     def _handle_search_enter(self):
-        self.browser.findText(self.search_bar.text())
+        """Enterキーで検索実行"""
+        text = self.search_bar.text()
+        if not text: return
+
+        if self.search_mode == "google":
+            url = f"https://www.google.com/search?q={text}"
+            self.browser.setUrl(QUrl(url))
+        else:
+            # [修正] 直接 findText を呼ばず、カウント機能付きのメソッドを呼ぶ
+            self._find_with_count(backward=False)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:

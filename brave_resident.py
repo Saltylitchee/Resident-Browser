@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QStatusBar, QMainWindow, QLabel
 )
 from PyQt6.QtCore import (
-    Qt, QUrl, QEvent, QTimer, QMetaObject, Q_ARG, QObject, pyqtSignal, QPoint
+    Qt, QUrl, QEvent, QTimer, QMetaObject, Q_ARG, QObject, pyqtSignal, QPoint, QCoreApplication
 )
 from PyQt6.QtGui import QCursor, QGuiApplication, QKeyEvent, QFont
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -87,31 +87,26 @@ class MiniWindow(QMainWindow):
         # JSONから初期位置・サイズを適用
         self.apply_config_geometry(config)
         
-        if config.get("url"):
-            self.browser.setUrl(QUrl(str(config["url"])))
-        
+        self.browser.page().setBackgroundColor(Qt.GlobalColor.transparent)
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         
     def apply_config_geometry(self, config):
         """JSONの設定を窓に反映させる"""
         self.setGeometry(
-            config.get("x", 960), 
-            config.get("y", 0), 
-            config.get("width", 480), 
-            config.get("height", 800)
+            config.get("x", 990), 
+            config.get("y", 28), 
+            config.get("width", 450), 
+            config.get("height", 830)
         )
 
     def _setup_browser(self):
-        if not os.path.exists(PROFILE_DIR): os.makedirs(PROFILE_DIR)
-        self.profile = QWebEngineProfile("BraveResidentStorage", self)
-        self.profile.setPersistentStoragePath(PROFILE_DIR)
-        self.page = QWebEnginePage(self.profile, self)
+        # プロファイルの指定を一切せず、デフォルトの「一時的なメモリ内プロファイル」を使う
+        # これにより、過去のキャッシュや設定の影響を完全に排除できます。
+        self.page = QWebEnginePage(self) 
         self.browser = QWebEngineView()
         self.browser.setPage(self.page)
         
-        # --- ここが重要 ---
-        # ブラウザ本体だけでなく、実際にキー入力を受け取る「中の人（focusProxy）」にも
-        # イベントフィルタをインストールして、Ctrl+Fを横取りできるようにします。
+        # イベントフィルタの設定はそのまま
         self.browser.installEventFilter(self)
         self.page.loadFinished.connect(self._install_proxy_filter)
 
@@ -254,47 +249,40 @@ def on_paste_signal():
             config = json.load(f)
     except: return
 
-    # 古いウィンドウが残っていたら、メモリから完全に解放する
+    # 1. 古いウィンドウの完全な破棄
     if current_window:
         current_window.close()
         current_window.deleteLater()
         current_window = None
 
-    # 新しく作り直す（これが一番確実）
+    # 2. 新しいウィンドウの生成
     current_window = MiniWindow(config)
     
-    # フラグ設定（今回は最初からセット）
+    # [デバッグ用] 枠を表示してOSに窓を認識させる（安定したら Frameless に戻せます）
     current_window.setWindowFlags(
         Qt.WindowType.Window | 
-        Qt.WindowType.FramelessWindowHint | 
-        Qt.WindowType.WindowStaysOnTopHint | 
-        Qt.WindowType.Tool
+        Qt.WindowType.WindowStaysOnTopHint
     )
     
-    # 座標確定
-    current_window.setGeometry(
-        config.get("x", 960), config.get("y", 0), 
-        config.get("width", 480), config.get("height", 800)
-    )
-    
-    # 表示してからURLを入れる
+    # 3. 窓を先に表示する
     current_window.show()
-    current_window.browser.setUrl(QUrl(config["url"]))
-    
     current_window.raise_()
     current_window.activateWindow()
 
-    # 4. 描画が走り出すための「最後の一押し」
-    def ultimate_refresh():
-        if current_window:
-            # ブラウザに直接「起きて描画しろ」と命令を送る
-            current_window.browser.update()
-            current_window.browser.repaint()
-            # 内部のスクロール位置を微動させて描画を誘発
-            current_window.page.runJavaScript("window.scrollBy(0,1); window.scrollBy(0,-1);")
-            print(f"Engine refresh signal sent: {config['url']}")
+    # 4. 窓が表示された「後」に、一度だけURLをセットする
+    # 即座に呼ぶのではなく、100ms待つことでエンジンの初期化を確実に完了させます
+    target_url = config.get("url")
+    if target_url:
+        # 重複呼び出しを防ぐため、ここ以外の setUrl はすべて削除またはコメントアウトしてください
+        QTimer.singleShot(100, lambda: current_window.browser.setUrl(QUrl(target_url)))
 
-    QTimer.singleShot(200, ultimate_refresh)
+    # 5. 描画が始まらない場合のバックアップ（一押し）
+    def force_refresh():
+        if current_window and current_window.browser:
+            current_window.browser.update()
+            print(f"Rendering triggered for: {target_url}")
+
+    QTimer.singleShot(500, force_refresh)
 
 # --- ホットキー監視 ---
 last_action_time = 0
@@ -313,36 +301,39 @@ def check_hotkeys():
 
 # --- メイン実行 ---
 if __name__ == "__main__":
-    # --- 1. Chromiumの設定：DirectX(D3D11)を明示的に指定 ---
-    # これにより YouTube の再生支援(GPU)を使いつつ、OpenGLの非互換エラーを回避します
+    # OSレベルで全てのGPUパスを封鎖する（最優先）
+    os.environ["QT_OPENGL"] = "software"
+    os.environ["QTWEBENGINE_DISABLE_GPU"] = "1"
+    
+    # 既存のフラグをさらに強化
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
-        "--use-angle=d3d11 "           # OpenGLをDirectX11に翻訳して実行
-        "--enable-gpu-rasterization "  # YouTube再生をスムーズにする
-        "--ignore-gpu-blocklist "      # 互換性チェックをスキップ
-        "--disable-vulkan"             # 不安定なVulkanを無効化
+        "--disable-gpu "
+        "--disable-gpu-compositing "
+        "--disable-software-rasterizer "
+        "--disable-gpu-sandbox "
+        "--in-process-gpu "  # GPUを別プロセスではなくメインプロセス内で動かそうとする（失敗しやすくなるので回避用）
+        "--no-sandbox"
     )
 
-    # --- 2. QApplication生成前の属性設定 ---
+    import sys
+
     from PyQt6.QtWidgets import QApplication
-    
-    # DesktopOpenGL への強制をやめ、Qtのデフォルト（自動選択）に任せる
-    # ただし、ソフトウェアレンダリングにならないよう属性は設定しない
+    from PyQt6.QtCore import QCoreApplication, Qt
+
+    # [最重要] アプリ生成前に、描画エンジンをソフトウェアモード（CPU）に固定
+    QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL)
     
     app = QApplication(sys.argv)
     
-    # --- 3. その他の設定 ---
+    # 既存の bridge 等の設定...
     sys.coinit_flags = 2 
     app.setQuitOnLastWindowClosed(False)
-
-    # 信号の接続（bridgeなどは既存のまま）
     bridge.copy_requested.connect(on_copy_signal)
     bridge.paste_requested.connect(on_paste_signal)
     
-    # タイマー起動（既存のまま）
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
     monitor_timer = QTimer()
     monitor_timer.timeout.connect(check_hotkeys)
     monitor_timer.start(50)
     
-    print("Watching for Alt+C / Alt+V... (Engine: ANGLE/D3D11)")
+    print("Running in Software Rendering Mode (CPU)...")
     sys.exit(app.exec())

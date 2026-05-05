@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QStatusBar, QMainWindow, QLabel
 )
 from PyQt6.QtCore import (
-    Qt, QUrl, QEvent, QTimer, QMetaObject, Q_ARG, QObject, pyqtSignal, QPoint, QCoreApplication
+    Qt, QUrl, QEvent, QTimer, QMetaObject, Q_ARG, QObject, pyqtSignal, QPoint
 )
 from PyQt6.QtGui import QCursor, QGuiApplication, QKeyEvent, QFont
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -87,26 +87,31 @@ class MiniWindow(QMainWindow):
         # JSONから初期位置・サイズを適用
         self.apply_config_geometry(config)
         
-        self.browser.page().setBackgroundColor(Qt.GlobalColor.transparent)
-        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        if config.get("url"):
+            self.browser.setUrl(QUrl(str(config["url"])))
         
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+
     def apply_config_geometry(self, config):
         """JSONの設定を窓に反映させる"""
         self.setGeometry(
-            config.get("x", 990), 
-            config.get("y", 28), 
-            config.get("width", 450), 
-            config.get("height", 830)
+            config.get("x", 960), 
+            config.get("y", 0), 
+            config.get("width", 480), 
+            config.get("height", 800)
         )
 
     def _setup_browser(self):
-        # プロファイルの指定を一切せず、デフォルトの「一時的なメモリ内プロファイル」を使う
-        # これにより、過去のキャッシュや設定の影響を完全に排除できます。
-        self.page = QWebEnginePage(self) 
+        if not os.path.exists(PROFILE_DIR): os.makedirs(PROFILE_DIR)
+        self.profile = QWebEngineProfile("BraveResidentStorage", self)
+        self.profile.setPersistentStoragePath(PROFILE_DIR)
+        self.page = QWebEnginePage(self.profile, self)
         self.browser = QWebEngineView()
         self.browser.setPage(self.page)
         
-        # イベントフィルタの設定はそのまま
+        # --- ここが重要 ---
+        # ブラウザ本体だけでなく、実際にキー入力を受け取る「中の人（focusProxy）」にも
+        # イベントフィルタをインストールして、Ctrl+Fを横取りできるようにします。
         self.browser.installEventFilter(self)
         self.page.loadFinished.connect(self._install_proxy_filter)
 
@@ -122,71 +127,24 @@ class MiniWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         
-        # --- 検索バー（ボタンと件数表示を追加） ---
+        # --- 検索バー（復活） ---
         self.search_container = QWidget()
         self.search_container.setStyleSheet("background: #f0f0f0; border-bottom: 1px solid #ccc;")
         s_layout = QHBoxLayout(self.search_container)
-        s_layout.setContentsMargins(5, 2, 5, 2)
-        
         self.search_bar = QLineEdit()
-        self.search_bar.setPlaceholderText("Search...")
-        
-        # 上下ボタン
-        self.btn_prev = QPushButton("▲")
-        self.btn_next = QPushButton("▼")
-        self.btn_prev.setFixedSize(24, 24)
-        self.btn_next.setFixedSize(24, 24)
-        
-        # 件数ラベル
-        self.search_status_label = QLabel("0/0")
-        self.search_status_label.setStyleSheet("color: #666; font-size: 10px; margin-right: 5px;")
-
-        s_layout.addWidget(self.search_bar)
-        s_layout.addWidget(self.search_status_label)
-        s_layout.addWidget(self.btn_prev)
-        s_layout.addWidget(self.btn_next)
-        
-        layout.addWidget(self.search_container)
-        self.search_container.hide()
-
-        # --- シグナル接続 ---
-        self.search_bar.textChanged.connect(lambda: self._do_search(forward=True))
+        self.search_bar.setPlaceholderText("Search in page...")
         self.search_bar.returnPressed.connect(self._handle_search_enter)
-        self.btn_next.clicked.connect(lambda: self._do_search(forward=True))
-        self.btn_prev.clicked.connect(lambda: self._do_search(forward=False))
+        s_layout.addWidget(self.search_bar)
+        layout.addWidget(self.search_container)
+        self.search_container.hide() # 最初は隠す
+        
+        layout.addWidget(self.browser)
+        self.statusBar = QStatusBar()
+        self.setStatusBar(self.statusBar)
 
     def _handle_search_enter(self):
-        """Enterで次へ、Shift+Enterで前へ"""
-        modifiers = QGuiApplication.queryKeyboardModifiers()
-        forward = not (modifiers & Qt.KeyboardModifier.ShiftModifier)
-        self._do_search(forward=forward)
-        
-    def _do_search(self, forward=True):
-        """検索実行と結果の更新"""
-        text = self.search_bar.text()
-        if not text:
-            self.browser.findText("") # 検索ハイライト消去
-            self.search_status_label.setText("0/0")
-            return
-
-        options = QWebEnginePage.FindFlag(0)
-        if not forward:
-            options |= QWebEnginePage.FindFlag.FindBackward
-        
-        # 検索実行。第3引数にコールバック関数を渡して結果を受け取る
-        self.browser.findText(text, options, self._update_search_count)
-
-    def _update_search_count(self, result):
-        """ヒット件数（現在/合計）を更新"""
-        # result は QWebEngineFindTextResult オブジェクト
-        count = result.numberOfMatches()
-        current = result.activeMatch() # 現在選択されているのは何件目か
-        self.search_status_label.setText(f"{current}/{count}")
-        
-        if count == 0 and self.search_bar.text():
-            self.search_status_label.setStyleSheet("color: red; font-size: 10px;")
-        else:
-            self.search_status_label.setStyleSheet("color: #666; font-size: 10px;")
+        """Enterで検索実行"""
+        self.browser.findText(self.search_bar.text())
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:
@@ -228,7 +186,7 @@ def on_copy_signal():
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             config = json.load(f)
     except:
-        config = {"x": 960, "y": 0, "width": 480, "height": 800}
+        config = {"x": 990, "y": 28, "width": 450, "height": 830}
 
     config["url"] = url
     
@@ -243,46 +201,30 @@ def show_floating_notify(text):
     _notif.show()
 
 def on_paste_signal():
+    """Alt+V: JSONの設定に従ってワープ"""
     global current_window
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             config = json.load(f)
     except: return
 
-    # 1. 古いウィンドウの完全な破棄
-    if current_window:
-        current_window.close()
-        current_window.deleteLater()
-        current_window = None
+    if not current_window:
+        current_window = MiniWindow(config)
 
-    # 2. 新しいウィンドウの生成
-    current_window = MiniWindow(config)
-    
-    # [デバッグ用] 枠を表示してOSに窓を認識させる（安定したら Frameless に戻せます）
+    # JSONの座標とサイズを適用
+    current_window.hide()
+    # 仮想デスクトップを跨ぐための再フラグ立て
     current_window.setWindowFlags(
-        Qt.WindowType.Window | 
-        Qt.WindowType.WindowStaysOnTopHint
+        current_window.windowFlags() | 
+        Qt.WindowType.WindowStaysOnTopHint | 
+        Qt.WindowType.Tool
     )
+    current_window.apply_config_geometry(config) # ここでJSONの値を反映
+    current_window.browser.setUrl(QUrl(config["url"]))
     
-    # 3. 窓を先に表示する
     current_window.show()
     current_window.raise_()
     current_window.activateWindow()
-
-    # 4. 窓が表示された「後」に、一度だけURLをセットする
-    # 即座に呼ぶのではなく、100ms待つことでエンジンの初期化を確実に完了させます
-    target_url = config.get("url")
-    if target_url:
-        # 重複呼び出しを防ぐため、ここ以外の setUrl はすべて削除またはコメントアウトしてください
-        QTimer.singleShot(100, lambda: current_window.browser.setUrl(QUrl(target_url)))
-
-    # 5. 描画が始まらない場合のバックアップ（一押し）
-    def force_refresh():
-        if current_window and current_window.browser:
-            current_window.browser.update()
-            print(f"Rendering triggered for: {target_url}")
-
-    QTimer.singleShot(500, force_refresh)
 
 # --- ホットキー監視 ---
 last_action_time = 0
@@ -301,39 +243,17 @@ def check_hotkeys():
 
 # --- メイン実行 ---
 if __name__ == "__main__":
-    # OSレベルで全てのGPUパスを封鎖する（最優先）
-    os.environ["QT_OPENGL"] = "software"
-    os.environ["QTWEBENGINE_DISABLE_GPU"] = "1"
-    
-    # 既存のフラグをさらに強化
-    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
-        "--disable-gpu "
-        "--disable-gpu-compositing "
-        "--disable-software-rasterizer "
-        "--disable-gpu-sandbox "
-        "--in-process-gpu "  # GPUを別プロセスではなくメインプロセス内で動かそうとする（失敗しやすくなるので回避用）
-        "--no-sandbox"
-    )
-
-    import sys
-
-    from PyQt6.QtWidgets import QApplication
-    from PyQt6.QtCore import QCoreApplication, Qt
-
-    # [最重要] アプリ生成前に、描画エンジンをソフトウェアモード（CPU）に固定
-    QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL)
-    
     app = QApplication(sys.argv)
-    
-    # 既存の bridge 等の設定...
-    sys.coinit_flags = 2 
     app.setQuitOnLastWindowClosed(False)
+    
     bridge.copy_requested.connect(on_copy_signal)
     bridge.paste_requested.connect(on_paste_signal)
     
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    
     monitor_timer = QTimer()
     monitor_timer.timeout.connect(check_hotkeys)
-    monitor_timer.start(50)
+    monitor_timer.start(50) # 感度を少し上げる
     
-    print("Running in Software Rendering Mode (CPU)...")
+    print("Watching for Alt+C / Alt+V... (Press Ctrl+C in console to stop)")
     sys.exit(app.exec())

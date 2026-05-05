@@ -64,16 +64,19 @@ class FloatingNotification(QWidget):
 class MiniWindow(QMainWindow):
     def __init__(self, config):
         super().__init__()
-        self.setWindowTitle("Resident Mini")
+        self.setWindowTitle("Brave Resident Mini")
+        self.config_at_start = config
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self._setup_browser()
         self._setup_ui()
-        
-        # 設定を反映
-        self.apply_config_geometry(config)
         if config.get("url"):
             self.browser.setUrl(QUrl(str(config["url"])))
-        
-        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, 'config_at_start'):
+            self.apply_config_geometry(self.config_at_start)
+            del self.config_at_start
 
     def apply_config_geometry(self, config):
         self.setGeometry(
@@ -90,6 +93,7 @@ class MiniWindow(QMainWindow):
         self.page = QWebEnginePage(self.profile, self)
         self.browser = QWebEngineView()
         self.browser.setPage(self.page)
+        self.browser.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.browser.installEventFilter(self)
         self.page.loadFinished.connect(self._install_proxy_filter)
 
@@ -125,16 +129,46 @@ class MiniWindow(QMainWindow):
         if event.type() == QEvent.Type.KeyPress:
             key = event.key()
             modifiers = event.modifiers()
-            if modifiers & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_F:
-                if self.search_container.isVisible():
-                    self.search_container.hide()
-                    self.browser.setFocus()
-                else:
-                    self.search_container.show()
-                    self.search_bar.setFocus()
-                    self.search_bar.selectAll()
+            if modifiers & Qt.KeyboardModifier.ControlModifier:
+                if key == Qt.Key.Key_F:
+                    if self.search_container.isVisible():
+                        self.search_container.hide()
+                        self.browser.setFocus()
+                    else:
+                        self.search_container.show()
+                        self.search_bar.setFocus()
+                        self.search_bar.selectAll()
+                    return True
+                elif key == Qt.Key.Key_W:
+                    self.close_mini_window()
+                    return True
+            if self.search_bar.hasFocus() and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._handle_search_enter()
+                return True
+            if key == Qt.Key.Key_Escape and self.search_container.isVisible():
+                self.search_container.hide()
+                self.browser.setFocus()
                 return True
         return super().eventFilter(obj, event)
+    
+    def contextMenuEvent(self, event):
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background-color: white; border: 1px solid #999; }
+            QMenu::item { padding: 5px 25px; }
+            QMenu::item:selected { background-color: #3a8fb7; color: white; }
+        """)
+        menu.addAction("戻る").triggered.connect(self.browser.back)
+        menu.addAction("進む").triggered.connect(self.browser.forward) # 追加
+        menu.addAction("リロード").triggered.connect(self.browser.reload)
+        menu.addSeparator()
+        close_action = menu.addAction("小窓を閉じる (Ctrl+W)")
+        close_action.triggered.connect(self.close_mini_window)
+        menu.exec(QCursor.pos())
+        
+    def close_mini_window(self):
+        self.hide()
 
 # ==========================================
 # 3. 各種シグナル・ホットキー処理

@@ -403,16 +403,11 @@ class MiniWindow(QMainWindow):
             self._show_indicator()
 
     def _show_indicator(self):
-        # videoの「再生秒数」が変化しているかで判定する、より実戦的なコード
         js_code = """
         (function() {
-            var v = document.querySelector('video.video-stream'); // YouTube専用のクラスを指定
-            if (!v) v = document.querySelector('video');
+            var v = document.querySelector('video');
             if (!v) return 'none';
-            
-            // シンプルに「今、止まっているか」だけを逆転させて返す
-            // 複雑な判定をあえて外すことで、アイコンの反応を良くします
-            return (v.paused || v.ended) ? 'paused' : 'playing';
+            return v.paused ? 'paused' : 'playing';
         })();
         """
         self.browser.page().runJavaScript(js_code, self._update_indicator_with_state)
@@ -519,7 +514,8 @@ class MiniWindow(QMainWindow):
             QTimer.singleShot(200, self._show_indicator)
             
     def show_and_activate(self):
-        """ウィンドウを表示し、最前面に持ってくる"""
+        # 表示前にフラグを再セットすることで、OSに「現在のコンテキスト」を再認識させる
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.show()
         self.raise_()
         self.activateWindow()

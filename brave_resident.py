@@ -1,6 +1,7 @@
 import sys
 import signal
 import os
+import re
 import json
 import time
 import keyboard
@@ -11,7 +12,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (
     Qt, QUrl, QEvent, QTimer, QObject, pyqtSignal
 )
-from PyQt6.QtGui import QCursor, QFont
+from PyQt6.QtGui import QCursor, QFont, QPainter, QBrush, QColor, QPen
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
 
@@ -55,7 +56,7 @@ class FloatingNotification(QWidget):
         
         layout = QVBoxLayout(self)
         self.label = QLabel(text)
-        self.label.setStyleSheet("background-color: rgba(0, 0, 0, 180); color: #00FF00; font-weight: bold; padding: 8px 15px; border-radius: 5px;")
+        self.label.setStyleSheet("background-color: rgba(0, 0, 0, 180); color: #00ff7f; font-weight: bold; padding: 8px 15px; border-radius: 5px;")
         self.label.setFont(QFont("Arial", 12))
         layout.addWidget(self.label)
         
@@ -64,10 +65,49 @@ class FloatingNotification(QWidget):
         QTimer.singleShot(1500, self.close)
 
 class ClickableLabel(QLabel):
-    clicked = pyqtSignal()
+    clicked = pyqtSignal(str)
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._current_color = "#00FF00" # デフォルト
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # 背景色と枠線の色
+        bg_color = QColor(60, 60, 60, 230)
+        border_color = QColor(self._current_color)
+
+        # 1. 描画エリアの確定（少し内側にマージンを取る）
+        rect = self.rect().adjusted(1, 1, -1, -1)
+
+        # 2. 背景の描画
+        painter.setBrush(QBrush(bg_color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(rect, 15, 15)
+
+        # 3. 枠線の描画
+        pen = QPen(border_color)
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.drawRoundedRect(rect, 15, 15)
+        
+        painter.end()
+
+        # 4. 文字だけを上に描画させる（背景を描画させないために重要）
+        # super().paintEvent(event) を呼ぶ前に背景を自前で塗りつぶしているので
+        # ラベルのデフォルト描画が干渉しないよう制御します
+        super().paintEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
+            # アイコン付近かタイトル付近かの判定
+            if event.pos().x() < 45:
+                self.clicked.emit("icon")
+            else:
+                self.clicked.emit("title")
             
 class MiniWindow(QMainWindow):
     def __init__(self, config):
@@ -80,8 +120,8 @@ class MiniWindow(QMainWindow):
         if config.get("url"):
             self.browser.setUrl(QUrl(str(config["url"])))
         self.audio_indicator = None
-        # 音声状態が変わった時に通知を受け取る設定
         self.browser.page().recentlyAudibleChanged.connect(self._handle_audio_status)
+        self.browser.titleChanged.connect(self._on_title_changed)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -273,6 +313,13 @@ class MiniWindow(QMainWindow):
         if event.type() == QEvent.Type.KeyPress:
             key = event.key()
             modifiers = event.modifiers()
+            if modifiers & Qt.KeyboardModifier.AltModifier:
+                if key == Qt.Key.Key_Left:
+                    self.browser.back()
+                    return True
+                elif key == Qt.Key.Key_Right:
+                    self.browser.forward()
+                    return True
             if obj == self.search_bar and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 self._handle_search_enter()
                 return True # イベントをここで消費
@@ -312,64 +359,151 @@ class MiniWindow(QMainWindow):
         menu.exec(QCursor.pos())
         
     def _handle_audio_status(self, audible):
-        """音が鳴り始めた/止まった時の処理"""
-        if audible and not self.isVisible():
-            self._show_audio_indicator()
-        else:
-            self._hide_audio_indicator()
+        """音が止まってもインジケーターは消さず、状態（アイコン）だけ更新する"""
+        if not self.isVisible():
+            # 音が止まった（一時停止した）瞬間に、アイコンを ♪ から || に変えるために再描画
+            self._show_indicator()
 
-    def _show_audio_indicator(self):
-        """画面端に動画タイトル付きのインジケーターを出す"""
+    def _on_title_changed(self, title):
+        """動画が切り替わるなどしてタイトルが変わった時の処理"""
+        # インジケーターが表示されている（格納状態である）時だけ更新をかける
+        if self.audio_indicator and self.audio_indicator.isVisible():
+            self._show_indicator()
+
+    def _show_indicator(self):
+        """JavaScriptでページの状態を確認してからインジケーターを表示する"""
+        # ページ内のビデオ状態をチェックするJS
+        js_code = """
+        (function() {
+            var v = document.querySelector('video');
+            if (!v) return 'none';
+            return v.paused ? 'paused' : 'playing';
+        })();
+        """
+        # JSを実行し、結果を _update_indicator_with_state に渡す
+        self.browser.page().runJavaScript(js_code, self._update_indicator_with_state)
+
+    def _update_indicator_with_state(self, state):
+        """JSの結果を受けて、アイコン幅固定のレイアウトで表示を確定させる"""
+        config = load_config()
+        color = config.get("theme_color", "#00FF00")
+
         if not self.audio_indicator:
-            # ① カスタムラベルを使用
             self.audio_indicator = ClickableLabel("", None)
             self.audio_indicator.setWindowFlags(
                 Qt.WindowType.FramelessWindowHint | 
                 Qt.WindowType.WindowStaysOnTopHint | 
                 Qt.WindowType.Tool
             )
-            # クリックされたらAlt+Sと同じ挙動（自分を表示）を呼び出す
+            self.audio_indicator.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
             self.audio_indicator.clicked.connect(self._handle_indicator_click)
             
-            self.audio_indicator.setStyleSheet("""
-                background: rgba(0, 0, 0, 180); color: #00FF00; 
-                padding: 8px; border-radius: 5px; font-weight: bold;
-                border: 1px solid #00FF00;
-            """)
-
-        # ② タイトルを取得して反映 (♪ + 動画タイトル)
-        video_title = self.browser.title()
-        if not video_title: video_title = "Audio Playing"
-        # 文字が長すぎると画面を覆うので、適度に省略
-        display_text = f"♪ {video_title[:30]}..." if len(video_title) > 30 else f"♪ {video_title}"
+            # --- レイアウトの構築 (初回のみ) ---
+            layout = QHBoxLayout(self.audio_indicator)
+            layout.setContentsMargins(10, 5, 10, 5) # インジケーターの「外枠」と「中身（アイコンや文字）」の間の隙間(左, 上, 右, 下)
+            layout.setSpacing(4) # 「アイコン」と「タイトル文字」の間の "距離"
+            
+            self.icon_label = QLabel()
+            self.icon_label.setFixedWidth(30) # アイコンが入る「透明な箱」の幅
+            self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            
+            self.text_label = QLabel()
+            
+            layout.addWidget(self.icon_label)
+            layout.addWidget(self.text_label)
         
-        self.audio_indicator.setText(display_text)
-        self.audio_indicator.adjustSize() # 文字数に合わせてサイズ調整
+        self.audio_indicator._current_color = color
 
+        # 状態に応じたアイコン設定
+        if state == 'playing':
+            icon = "♪" # 再生中のアイコン
+        elif state == 'paused':
+            icon = "||" # 一時停止中のアイコン
+        else:
+            icon = "❏" # 動画サイト以外のアイコン
+
+        # タイトル整形
+        raw_title = self.browser.title()
+        clean_title = re.sub(r'^\(\d+\)\s*', '', raw_title)
+        if not clean_title or clean_title == "about:blank": 
+            clean_title = "Resident Mini"
+
+        # ラベルに値をセット
+        self.icon_label.setText(icon)
+        self.text_label.setText(f"{clean_title[:30]}...")
+        
+        # スタイル適用（背景を透明にしてpaintEventの描画を活かす）
+        label_style = f"color: {color}; font-weight: bold; border: none; background: transparent;"
+        self.icon_label.setStyleSheet(label_style)
+        self.text_label.setStyleSheet(label_style)
+
+        # 全体のサイズを内容に合わせる
+        self.audio_indicator.adjustSize()
+
+        # 配置（右下）
         screen_rect = QApplication.primaryScreen().geometry()
-        # サイズが変わるので右下配置を再計算
         self.audio_indicator.move(
-            screen_rect.width() - self.audio_indicator.width() - 5, 
-            screen_rect.height() - 80
+            screen_rect.width() - self.audio_indicator.width() - 10, 
+            screen_rect.height() - 75
         )
         self.audio_indicator.show()
 
-    def _handle_indicator_click(self):
-        """インジケーターがクリックされた時の処理"""
-        self.show()
-        self.raise_()
-        self.activateWindow()
-        self._hide_audio_indicator()
+    def _handle_indicator_click(self, area):
+        """4. クリックエリアに応じた処理の分岐"""
+        if area == "title":
+            # タイトルクリックで再表示（Alt+Sと同じ）
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            self._hide_audio_indicator()
+        
+        elif area == "icon":
+            # YouTubeの内部APIまたはvideo要素に直接干渉する強力なJS
+            js_toggle = """
+            (function() {
+                // 1. YouTubeの内部API(playerApi)を利用したトグル
+                var moviePlayer = document.querySelector('#movie_player');
+                if (moviePlayer && moviePlayer.getPlayerState) {
+                    var state = moviePlayer.getPlayerState();
+                    if (state === 1) { // 1: 再生中
+                        moviePlayer.pauseVideo();
+                    } else {
+                        moviePlayer.playVideo();
+                    }
+                    return;
+                }
+
+                // 2. ショート動画用のオーバーレイ要素を直接探してクリック
+                var shortsPlayer = document.querySelector('video.video-stream');
+                if (shortsPlayer) {
+                    if (shortsPlayer.paused) { shortsPlayer.play(); }
+                    else { shortsPlayer.pause(); }
+                    return;
+                }
+
+                // 3. 最終手段：スペースキー送信
+                window.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 32 }));
+            })();
+            """
+            self.browser.page().runJavaScript(js_toggle)
+            # クリック直後に状態を再確認してインジケーターを更新
+            QTimer.singleShot(200, self._show_indicator)
+            
+            # アイコンの見た目を即座に切り替える（簡易的なフィードバック）
+            current_text = self.audio_indicator.text()
+            if "♪" in current_text:
+                self.audio_indicator.setText(current_text.replace("♪", "||"))
+            else:
+                self.audio_indicator.setText(current_text.replace("||", "♪"))
 
     def _hide_audio_indicator(self):
         if self.audio_indicator:
             self.audio_indicator.hide()
 
     def close_mini_window(self):
-        """[修正] 隠す際、音が鳴っていたらインジケーターを出す"""
+        """小窓を閉じたら、必ずインジケーターとして格納する"""
         self.hide()
-        if self.browser.page().recentlyAudible():
-            self._show_audio_indicator()
+        self._show_indicator()
 
 # ==========================================
 # 3. 各種シグナル・ホットキー処理
@@ -451,7 +585,18 @@ def on_show_signal():
 
 def show_floating_notify(text):
     global _notif
+    config = load_config()
+    # "indicator_color" を "theme_color" に置換済みの前提
+    theme_color = config.get("theme_color", "#00FF00")
+    
     _notif = FloatingNotification(text)
+    # 通知ラベルのスタイルをJSONの色に同期
+    _notif.label.setStyleSheet(f"""
+        color: {theme_color}; 
+        font-weight: bold; 
+        font-size: 14px;
+        background: transparent;
+    """)
     _notif.show()
 
 last_action_time = 0
@@ -461,13 +606,16 @@ def check_hotkeys():
     if now - last_action_time < 0.3: return
     
     if keyboard.is_pressed('alt'):
+        # Shiftが押されているか確認
+        is_shift = keyboard.is_pressed('shift')
+        
         if keyboard.is_pressed('c'):
             bridge.copy_requested.emit()
             last_action_time = now
         elif keyboard.is_pressed('v'):
             bridge.paste_requested.emit()
             last_action_time = now
-        elif keyboard.is_pressed('s'):  # ← 追加
+        elif keyboard.is_pressed('s') and not is_shift: # ★Shiftが押されていない時だけ実行
             bridge.show_requested.emit()
             last_action_time = now
 

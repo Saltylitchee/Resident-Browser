@@ -1,7 +1,12 @@
 {
-    "url": "https://youtube.com",
     "x": 1090,
-    "y": 25,
+    "y": 180,
     "width": 350,
-    "height": 670
+    "height": 670,
+    "url": "https://youtube.com",
+    "favorites": [
+        "https://www.youtube.com",
+        "https://gemini.google.com/app"
+    ],
+    "search_mode": "find"
 }

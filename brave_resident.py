@@ -183,6 +183,18 @@ class MiniWindow(QMainWindow):
         self.setStatusBar(self.statusBar)
         self.search_mode = "google"
         
+        config = load_config()
+        saved_mode = config.get("search_mode", "google")
+        
+        # 初期状態を設定
+        self.search_mode = "google" # 一旦デフォルトに
+        if saved_mode == "find":
+            # findモードへの切り替え処理を実行
+            self.toggle_search_mode() 
+        else:
+            # googleモードの初期状態を確定（色は既にセットされているので検索バーの表示等）
+            self.search_bar.setPlaceholderText("Google Search...")
+        
     def toggle_search_mode(self):
         """トグルボタンでモードを切り替える"""
         if self.search_mode == "google":
@@ -199,7 +211,15 @@ class MiniWindow(QMainWindow):
             self.search_bar.setPlaceholderText("Google Search...")
             self.find_group.hide()
             self.fav_group.show()
+        self.save_current_mode()
         self.search_bar.setFocus()
+        
+    def save_current_mode(self):
+        """現在の検索モードをJSONに書き込む"""
+        config = load_config()
+        config["search_mode"] = self.search_mode
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
         
     # --- 新設：ヒット件数を取得しながら検索する ---
     def _find_with_count(self, backward=False):
@@ -273,7 +293,7 @@ class MiniWindow(QMainWindow):
         menu.addAction("進む").triggered.connect(self.browser.forward) # 追加
         menu.addAction("リロード").triggered.connect(self.browser.reload)
         menu.addSeparator()
-        close_action = menu.addAction("小窓を閉じる (Ctrl+W)")
+        close_action = menu.addAction("閉じる (Ctrl+W)")
         close_action.triggered.connect(self.close_mini_window)
         menu.exec(QCursor.pos())
         

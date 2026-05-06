@@ -301,7 +301,7 @@ class MiniWindow(QMainWindow):
         menu.addAction("進む").triggered.connect(self.browser.forward) # 追加
         menu.addAction("リロード").triggered.connect(self.browser.reload)
         menu.addSeparator()
-        close_action = menu.addAction("閉じる (Ctrl+W)")
+        close_action = menu.addAction("隠す (Ctrl+W)")
         close_action.triggered.connect(self.close_mini_window)
         menu.exec(QCursor.pos())
         
@@ -402,6 +402,21 @@ def on_paste_signal():
     current_window.show()
     current_window.raise_()
     current_window.activateWindow()
+    
+def on_show_signal():
+    """Alt+S：現在のウィンドウをそのまま再表示する"""
+    global current_window
+    if current_window:
+        current_window.show()
+        current_window.raise_()
+        current_window.activateWindow()
+        
+        # もし音声インジケーターが表示されていたら隠す
+        if hasattr(current_window, '_hide_audio_indicator'):
+            current_window._hide_audio_indicator()
+    else:
+        # ウィンドウがまだ一度も作られていない場合は「コピーからしてね」と通知
+        show_floating_notify("No window to show. Press Alt+C first.")
 
 def show_floating_notify(text):
     global _notif
@@ -432,8 +447,10 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     
+    # --- ここが「配線」の完成形 ---
     bridge.copy_requested.connect(on_copy_signal)
     bridge.paste_requested.connect(on_paste_signal)
+    bridge.show_requested.connect(on_show_signal)  # ← これを追記！
     
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     
@@ -441,5 +458,5 @@ if __name__ == "__main__":
     monitor_timer.timeout.connect(check_hotkeys)
     monitor_timer.start(50)
     
-    print("Watching for Alt+C / Alt+V... (Press Ctrl+C in console to stop)")
+    print("Watching Alt+C/V/S... (Press Ctrl+C to stop)")
     sys.exit(app.exec())

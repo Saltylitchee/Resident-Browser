@@ -63,6 +63,12 @@ class FloatingNotification(QWidget):
         self.move(pos.x() + 20, pos.y() - 20)
         QTimer.singleShot(1500, self.close)
 
+class ClickableLabel(QLabel):
+    clicked = pyqtSignal()
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            
 class MiniWindow(QMainWindow):
     def __init__(self, config):
         super().__init__()
@@ -313,22 +319,47 @@ class MiniWindow(QMainWindow):
             self._hide_audio_indicator()
 
     def _show_audio_indicator(self):
-        """画面端に小さな音符マークを出す（簡易版）"""
+        """画面端に動画タイトル付きのインジケーターを出す"""
         if not self.audio_indicator:
-            self.audio_indicator = QLabel("♪ Audio Playing", None)
+            # ① カスタムラベルを使用
+            self.audio_indicator = ClickableLabel("", None)
             self.audio_indicator.setWindowFlags(
                 Qt.WindowType.FramelessWindowHint | 
                 Qt.WindowType.WindowStaysOnTopHint | 
                 Qt.WindowType.Tool
             )
+            # クリックされたらAlt+Sと同じ挙動（自分を表示）を呼び出す
+            self.audio_indicator.clicked.connect(self._handle_indicator_click)
+            
             self.audio_indicator.setStyleSheet("""
-                background: rgba(0, 0, 0, 150); color: white; 
-                padding: 5px; border-radius: 5px; font-weight: bold;
+                background: rgba(0, 0, 0, 180); color: #00FF00; 
+                padding: 8px; border-radius: 5px; font-weight: bold;
+                border: 1px solid #00FF00;
             """)
-        # 画面の右下に配置
+
+        # ② タイトルを取得して反映 (♪ + 動画タイトル)
+        video_title = self.browser.title()
+        if not video_title: video_title = "Audio Playing"
+        # 文字が長すぎると画面を覆うので、適度に省略
+        display_text = f"♪ {video_title[:30]}..." if len(video_title) > 30 else f"♪ {video_title}"
+        
+        self.audio_indicator.setText(display_text)
+        self.audio_indicator.adjustSize() # 文字数に合わせてサイズ調整
+
         screen_rect = QApplication.primaryScreen().geometry()
-        self.audio_indicator.move(screen_rect.width() - 120, screen_rect.height() - 80)
+        # サイズが変わるので右下配置を再計算
+        self.audio_indicator.move(
+            screen_rect.width() - self.audio_indicator.width() - 5, 
+            screen_rect.height() - 80
+        )
         self.audio_indicator.show()
+
+    def _handle_indicator_click(self):
+        """インジケーターがクリックされた時の処理"""
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self._hide_audio_indicator()
 
     def _hide_audio_indicator(self):
         if self.audio_indicator:

@@ -42,6 +42,7 @@ class GlobalBridge(QObject):
     copy_requested = pyqtSignal()
     paste_requested = pyqtSignal()
     show_requested = pyqtSignal()
+    preset_requested = pyqtSignal()
 
 bridge = GlobalBridge()
 current_window = None
@@ -122,6 +123,16 @@ class MiniWindow(QMainWindow):
         self.audio_indicator = None
         self.browser.page().recentlyAudibleChanged.connect(self._handle_audio_status)
         self.browser.titleChanged.connect(self._on_title_changed)
+        bridge.preset_requested.connect(self.toggle_window_preset)
+        latest_config = load_config()
+        presets = latest_config.get("presets", [])
+        self._current_preset_idx = latest_config.get("current_preset_index", 0) # selfをつける
+
+        if presets and 0 <= self._current_preset_idx < len(presets):
+            p = presets[self._current_preset_idx]
+            self.setGeometry(p["x"], p["y"], p["width"], p["height"])
+        else:
+            self.setGeometry(990, 25, 450, 830)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -358,6 +369,27 @@ class MiniWindow(QMainWindow):
         close_action.triggered.connect(self.close_mini_window)
         menu.exec(QCursor.pos())
         
+    def toggle_window_preset(self):
+        """プリセットを切り替え、即座に『物理ファイル』へ書き込む"""
+        # 常に最新のJSON状態を取得
+        config = load_config()
+        presets = config.get("presets", [])
+        if not presets: return
+
+        # インデックスをインクリメント（循環）
+        self._current_preset_idx = (self._current_preset_idx + 1) % len(presets)
+        
+        # 座標の適用
+        p = presets[self._current_preset_idx]
+        self.setGeometry(p["x"], p["y"], p["width"], p["height"])
+        
+        # 重要：辞書を直接更新して保存
+        config["current_preset_index"] = self._current_preset_idx
+        save_config(config)
+        
+        # デバッグ用（コンソールに今のインデックスを表示させると確実です）
+        print(f"Preset changed to: {self._current_preset_idx}")
+        
     def _handle_audio_status(self, audible):
         """音が止まってもインジケーターは消さず、状態（アイコン）だけ更新する"""
         if not self.isVisible():
@@ -371,16 +403,18 @@ class MiniWindow(QMainWindow):
             self._show_indicator()
 
     def _show_indicator(self):
-        """JavaScriptでページの状態を確認してからインジケーターを表示する"""
-        # ページ内のビデオ状態をチェックするJS
+        # videoの「再生秒数」が変化しているかで判定する、より実戦的なコード
         js_code = """
         (function() {
-            var v = document.querySelector('video');
+            var v = document.querySelector('video.video-stream'); // YouTube専用のクラスを指定
+            if (!v) v = document.querySelector('video');
             if (!v) return 'none';
-            return v.paused ? 'paused' : 'playing';
+            
+            // シンプルに「今、止まっているか」だけを逆転させて返す
+            // 複雑な判定をあえて外すことで、アイコンの反応を良くします
+            return (v.paused || v.ended) ? 'paused' : 'playing';
         })();
         """
-        # JSを実行し、結果を _update_indicator_with_state に渡す
         self.browser.page().runJavaScript(js_code, self._update_indicator_with_state)
 
     def _update_indicator_with_state(self, state):
@@ -458,41 +492,40 @@ class MiniWindow(QMainWindow):
             self._hide_audio_indicator()
         
         elif area == "icon":
-            # 画面上で最も大きく表示されているビデオを操作する
-            # 最後に実行結果（'paused' or 'playing'）を返すように改良
             js_toggle = """
             (function() {
                 var videos = document.querySelectorAll('video');
                 var targetVideo = null;
-                
-                if (videos.length === 1) {
-                    targetVideo = videos[0];
-                } else {
-                    var maxH = 0;
-                    for (var i = 0; i < videos.length; i++) {
-                        var rect = videos[i].getBoundingClientRect();
-                        if (rect.height > maxH) {
-                            maxH = rect.height;
-                            targetVideo = videos[i];
-                        }
+                var maxH = 0;
+                for (var i = 0; i < videos.length; i++) {
+                    var rect = videos[i].getBoundingClientRect();
+                    if (rect.height > maxH) {
+                        maxH = rect.height;
+                        targetVideo = videos[i];
                     }
                 }
-
                 if (targetVideo) {
-                    if (targetVideo.paused) {
-                        targetVideo.play();
-                    } else {
-                        targetVideo.pause();
-                    }
-                    // 操作後の状態を返して、Python側の更新関数に渡す
-                    return targetVideo.paused ? 'paused' : 'playing';
+                    if (targetVideo.paused) { targetVideo.play(); }
+                    else { targetVideo.pause(); }
+                    return true;
                 }
-                return 'none';
+                return false;
             })();
             """
-            # runJavaScriptの第2引数に、表示更新用の関数を指定する
-            # これにより QTimer を使わなくても、JS完了と同時に見た目が変わる
-            self.browser.page().runJavaScript(js_toggle, self._update_indicator_with_state)
+            self.browser.page().runJavaScript(js_toggle)
+            
+            # 【重要】JS実行の「200ms後」に、最新の状態を反映させる
+            # これにより、再生/停止が完了した後の「真の状態」をアイコンに反映できます
+            QTimer.singleShot(200, self._show_indicator)
+            
+    def show_and_activate(self):
+        """ウィンドウを表示し、最前面に持ってくる"""
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        # インジケーターを消す処理などがあればここに追加
+        if self.audio_indicator:
+            self.audio_indicator.hide()
 
     def _hide_audio_indicator(self):
         if self.audio_indicator:
@@ -515,6 +548,14 @@ def load_config():
     except Exception as e:
         print(f"Config load error: {e}")
     return DEFAULT_CONFIG.copy()
+
+def save_config(config):
+    """設定をJSONファイルに保存する"""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"設定の保存に失敗しました: {e}")
 
 def get_brave_url():
     try:
@@ -539,32 +580,23 @@ def on_copy_signal():
     if not url: return
 
     config = load_config()
+    # 既存の座標データを消さないよう、URLだけを更新
     config["url"] = url
-    
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=4, ensure_ascii=False)
-    
+    save_config(config) # 10個目の save_config 関数を使う
     show_floating_notify("★URL Updated!")
 
 def on_paste_signal():
     global current_window
+    if not current_window: return # mainで作成済みのはず
+
     config = load_config()
-
-    if not current_window:
-        current_window = MiniWindow(config)
-
-    # 座標とURLを更新
+    # 1. 座標とURLを反映
     current_window.apply_config_geometry(config)
-    current_window.browser.setUrl(QUrl(config.get("url", DEFAULT_CONFIG["url"])))
+    target_url = config.get("url", DEFAULT_CONFIG["url"])
+    current_window.browser.setUrl(QUrl(target_url))
     
-    # ウィンドウフラグの再設定（仮想デスクトップ対策）
-    current_window.setWindowFlags(
-        current_window.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
-    )
-    
-    current_window.show()
-    current_window.raise_()
-    current_window.activateWindow()
+    # 2. 表示
+    current_window.show_and_activate()
     
 def on_show_signal():
     """Alt+S：現在のウィンドウをそのまま再表示する"""
@@ -616,6 +648,9 @@ def check_hotkeys():
         elif keyboard.is_pressed('s') and not is_shift: # ★Shiftが押されていない時だけ実行
             bridge.show_requested.emit()
             last_action_time = now
+        elif keyboard.is_pressed('d') and not is_shift: # Alt + D
+            bridge.preset_requested.emit()
+            last_action_time = now
 
 # ==========================================
 # 4. メイン実行
@@ -624,16 +659,28 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     
-    # --- ここが「配線」の完成形 ---
+    # 1. 設定をロード
+    config = load_config()
+    
+    # 2. ウィンドウを作成
+    main_window = MiniWindow(config)
+    
+    # [修正ポイント] 
+    # トップレベルなので global 宣言は不要です。
+    # そのまま代入するだけで、他の関数（on_paste_signal等）から
+    # global current_window を通じてアクセス可能になります。
+    current_window = main_window 
+    
+    # 3. シグナルの配線
     bridge.copy_requested.connect(on_copy_signal)
     bridge.paste_requested.connect(on_paste_signal)
-    bridge.show_requested.connect(on_show_signal)  # ← これを追記！
-    
+    bridge.show_requested.connect(main_window.show_and_activate)
+    bridge.preset_requested.connect(main_window.toggle_window_preset)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     
     monitor_timer = QTimer()
     monitor_timer.timeout.connect(check_hotkeys)
     monitor_timer.start(50)
     
-    print("Watching Alt+C/V/S... (Press Ctrl+C to stop)")
+    print("Watching Alt+C/V/D/S... (Press Ctrl+C to stop)")
     sys.exit(app.exec())

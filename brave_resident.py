@@ -40,6 +40,7 @@ JS_COPY_SCRIPT = "window.getSelection().toString();"
 class GlobalBridge(QObject):
     copy_requested = pyqtSignal()
     paste_requested = pyqtSignal()
+    show_requested = pyqtSignal()
 
 bridge = GlobalBridge()
 current_window = None
@@ -72,6 +73,9 @@ class MiniWindow(QMainWindow):
         self._setup_ui()
         if config.get("url"):
             self.browser.setUrl(QUrl(str(config["url"])))
+        self.audio_indicator = None
+        # 音声状態が変わった時に通知を受け取る設定
+        self.browser.page().recentlyAudibleChanged.connect(self._handle_audio_status)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -244,7 +248,7 @@ class MiniWindow(QMainWindow):
             self.hit_label.setText("0/0")
 
     def _handle_search_enter(self):
-        """Enterキーで検索実行"""
+        """Enterキーで検索実行（Shift併用で逆方向）"""
         text = self.search_bar.text()
         if not text: return
 
@@ -252,13 +256,20 @@ class MiniWindow(QMainWindow):
             url = f"https://www.google.com/search?q={text}"
             self.browser.setUrl(QUrl(url))
         else:
-            # [修正] 直接 findText を呼ばず、カウント機能付きのメソッドを呼ぶ
-            self._find_with_count(backward=False)
+            # Shiftキーが押されているか判定
+            modifiers = QApplication.keyboardModifiers()
+            is_shift = modifiers & Qt.KeyboardModifier.ShiftModifier
+            
+            # Shiftがあれば逆方向（backward=True）
+            self._find_with_count(backward=bool(is_shift))
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:
             key = event.key()
             modifiers = event.modifiers()
+            if obj == self.search_bar and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._handle_search_enter()
+                return True # イベントをここで消費
             if modifiers & Qt.KeyboardModifier.ControlModifier:
                 if key == Qt.Key.Key_F:
                     if self.search_container.isVisible():
@@ -272,9 +283,6 @@ class MiniWindow(QMainWindow):
                 elif key == Qt.Key.Key_W:
                     self.close_mini_window()
                     return True
-            if self.search_bar.hasFocus() and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                self._handle_search_enter()
-                return True
             if key == Qt.Key.Key_Escape and self.search_container.isVisible():
                 self.search_container.hide()
                 self.browser.setFocus()
@@ -297,8 +305,40 @@ class MiniWindow(QMainWindow):
         close_action.triggered.connect(self.close_mini_window)
         menu.exec(QCursor.pos())
         
+    def _handle_audio_status(self, audible):
+        """音が鳴り始めた/止まった時の処理"""
+        if audible and not self.isVisible():
+            self._show_audio_indicator()
+        else:
+            self._hide_audio_indicator()
+
+    def _show_audio_indicator(self):
+        """画面端に小さな音符マークを出す（簡易版）"""
+        if not self.audio_indicator:
+            self.audio_indicator = QLabel("♪ Audio Playing", None)
+            self.audio_indicator.setWindowFlags(
+                Qt.WindowType.FramelessWindowHint | 
+                Qt.WindowType.WindowStaysOnTopHint | 
+                Qt.WindowType.Tool
+            )
+            self.audio_indicator.setStyleSheet("""
+                background: rgba(0, 0, 0, 150); color: white; 
+                padding: 5px; border-radius: 5px; font-weight: bold;
+            """)
+        # 画面の右下に配置
+        screen_rect = QApplication.primaryScreen().geometry()
+        self.audio_indicator.move(screen_rect.width() - 120, screen_rect.height() - 80)
+        self.audio_indicator.show()
+
+    def _hide_audio_indicator(self):
+        if self.audio_indicator:
+            self.audio_indicator.hide()
+
     def close_mini_window(self):
+        """[修正] 隠す際、音が鳴っていたらインジケーターを出す"""
         self.hide()
+        if self.browser.page().recentlyAudible():
+            self._show_audio_indicator()
 
 # ==========================================
 # 3. 各種シグナル・ホットキー処理
@@ -380,6 +420,9 @@ def check_hotkeys():
             last_action_time = now
         elif keyboard.is_pressed('v'):
             bridge.paste_requested.emit()
+            last_action_time = now
+        elif keyboard.is_pressed('s'):  # ← 追加
+            bridge.show_requested.emit()
             last_action_time = now
 
 # ==========================================

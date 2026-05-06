@@ -4,6 +4,7 @@
     "width": 350,
     "height": 670,
     "url": "https://youtube.com",
+    "theme_color": "#00ff7f",
     "favorites": [
         "https://www.youtube.com",
         "https://gemini.google.com/app"

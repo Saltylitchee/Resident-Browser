@@ -449,52 +449,50 @@ class MiniWindow(QMainWindow):
         self.audio_indicator.show()
 
     def _handle_indicator_click(self, area):
-        """4. クリックエリアに応じた処理の分岐"""
+        """インジケーターがクリックされた時の処理"""
         if area == "title":
-            # タイトルクリックで再表示（Alt+Sと同じ）
+            # タイトルクリックで再表示
             self.show()
             self.raise_()
             self.activateWindow()
             self._hide_audio_indicator()
         
         elif area == "icon":
-            # YouTubeの内部APIまたはvideo要素に直接干渉する強力なJS
+            # 画面上で最も大きく表示されているビデオを操作する
+            # 最後に実行結果（'paused' or 'playing'）を返すように改良
             js_toggle = """
             (function() {
-                // 1. YouTubeの内部API(playerApi)を利用したトグル
-                var moviePlayer = document.querySelector('#movie_player');
-                if (moviePlayer && moviePlayer.getPlayerState) {
-                    var state = moviePlayer.getPlayerState();
-                    if (state === 1) { // 1: 再生中
-                        moviePlayer.pauseVideo();
-                    } else {
-                        moviePlayer.playVideo();
+                var videos = document.querySelectorAll('video');
+                var targetVideo = null;
+                
+                if (videos.length === 1) {
+                    targetVideo = videos[0];
+                } else {
+                    var maxH = 0;
+                    for (var i = 0; i < videos.length; i++) {
+                        var rect = videos[i].getBoundingClientRect();
+                        if (rect.height > maxH) {
+                            maxH = rect.height;
+                            targetVideo = videos[i];
+                        }
                     }
-                    return;
                 }
 
-                // 2. ショート動画用のオーバーレイ要素を直接探してクリック
-                var shortsPlayer = document.querySelector('video.video-stream');
-                if (shortsPlayer) {
-                    if (shortsPlayer.paused) { shortsPlayer.play(); }
-                    else { shortsPlayer.pause(); }
-                    return;
+                if (targetVideo) {
+                    if (targetVideo.paused) {
+                        targetVideo.play();
+                    } else {
+                        targetVideo.pause();
+                    }
+                    // 操作後の状態を返して、Python側の更新関数に渡す
+                    return targetVideo.paused ? 'paused' : 'playing';
                 }
-
-                // 3. 最終手段：スペースキー送信
-                window.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 32 }));
+                return 'none';
             })();
             """
-            self.browser.page().runJavaScript(js_toggle)
-            # クリック直後に状態を再確認してインジケーターを更新
-            QTimer.singleShot(200, self._show_indicator)
-            
-            # アイコンの見た目を即座に切り替える（簡易的なフィードバック）
-            current_text = self.audio_indicator.text()
-            if "♪" in current_text:
-                self.audio_indicator.setText(current_text.replace("♪", "||"))
-            else:
-                self.audio_indicator.setText(current_text.replace("||", "♪"))
+            # runJavaScriptの第2引数に、表示更新用の関数を指定する
+            # これにより QTimer を使わなくても、JS完了と同時に見た目が変わる
+            self.browser.page().runJavaScript(js_toggle, self._update_indicator_with_state)
 
     def _hide_audio_indicator(self):
         if self.audio_indicator:

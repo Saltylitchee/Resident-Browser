@@ -7,7 +7,7 @@
     "presets": [
         {
             "name": "デフォルト",
-            "last_url": "https://youtube.com/watch?v=lVaCdidMYhs",
+            "last_url": "https://www.youtube.com/watch?v=lVaCdidMYhs&t=240s",
             "indicator_styles": {
                 "shape": "rounded_rect",
                 "text_color": "#00FF00",
@@ -30,8 +30,7 @@
                     "y": 180,
                     "width": 350,
                     "height": 670,
-                    "opacity": 1.0,
-                    "is_locked": true
+                    "opacity": 1.0
                 },
                 {
                     "x": 1026,

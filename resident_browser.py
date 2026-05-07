@@ -15,7 +15,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QCursor, QFont, QPainter, QBrush, QColor, QPen
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
+from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
 
 # ==========================================
 # 1. 定数・デフォルト設定の集約
@@ -184,8 +184,12 @@ class ResidentWindow(QMainWindow):
         # --- 3. シグナルの接続 ---
         self.browser.page().recentlyAudibleChanged.connect(self._handle_audio_status)
         self.browser.titleChanged.connect(self._on_title_changed)
-        self.browser.loadFinished.connect(self.adjust_zoom)
+        
+        # loadFinished だけでなく、URL変更時にもJSを注入する
         self.browser.loadFinished.connect(self.inject_adblock)
+        self.browser.urlChanged.connect(lambda: self.inject_adblock()) 
+        
+        self.browser.loadFinished.connect(self.adjust_zoom)
         
         # --- 4. データのロードと表示 ---
         # プリセット情報を取得
@@ -210,67 +214,91 @@ class ResidentWindow(QMainWindow):
         if not os.path.exists(PROFILE_DIR): os.makedirs(PROFILE_DIR)
         self.profile = QWebEngineProfile("PortalResidentStorage", self)
         self.profile.setPersistentStoragePath(PROFILE_DIR)
+        
+        # --- 追加: セキュリティ設定の緩和 ---
+        s = self.profile.settings()
+        s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        # クロスドメイン制限やローカルアクセス制限を緩和してJSの干渉力を強める
+        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        s.setAttribute(QWebEngineSettings.WebAttribute.ErrorPageEnabled, True)
+        # --- ここまで ---
+
         self.page = QWebEnginePage(self.profile, self)
         self.browser = QWebEngineView()
         self.browser.setPage(self.page)
+        
+        # コンテキストメニューなどは維持
         self.browser.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.browser.installEventFilter(self)
         self.page.loadFinished.connect(self._install_proxy_filter)
         
     def inject_adblock(self):
+        # ログが出ることは確認済みなので、中身を「最も単純な背景色変更」でテストします
+        print(f"DEBUG: Attempting JS Execution on {self.browser.url().toString()}")
+
         js_code = """
         (function() {
-            console.log("ResidentWindow: Targeted Ad-Cleaning start...");
+            console.log("RESIDENT_JS: Executing...");
             
-            const applyFix = () => {
-                // 1. 強力なCSSによる「空間抹殺」（これを最初に行う）
-                const styleId = 'resident-super-shield';
-                if (!document.getElementById(styleId)) {
-                    const style = document.createElement('style');
-                    style.id = styleId;
-                    style.innerHTML = `
-                        /* 広告が含まれる可能性のある枠自体を消す */
-                        ytd-ad-slot-renderer, 
-                        ytd-companion-slot-renderer, 
-                        #player-ads, 
-                        .video-ads, 
-                        .ytp-ad-module,
-                        #masthead-ad { 
-                            display: none !important; 
-                        }
-                        /* シアターモード時のレイアウト補正（継続） */
-                        ytd-watch-flexy[theater] #columns.ytd-watch-flexy { margin: 0 !important; }
-                        #primary.ytd-watch-flexy { max-width: 100% !important; padding: 0 !important; }
-                    `;
-                    document.head.appendChild(style);
-                }
+            // テスト1: 画面を真っ赤にする（これが動けば、JSはDOMに触れています）
+            // document.body.style.backgroundColor = 'red'; 
 
-                // 2. 「ad」という文字列をIDやクラスに含む要素を全スキャンして消去
-                // (これは少し過激ですが、個人開発のデバッグとしては有効です)
-                const allElements = document.querySelectorAll('*');
-                allElements.forEach(el => {
-                    if (el.id && (el.id.includes('ad-') || el.id.includes('-ad'))) {
-                    if (!el.closest('#movie_player')) el.remove(); // プレイヤー以外なら消す
+            // 本番ロジック: CSS Injection
+            const styleId = 'resident-shield';
+            if (!document.getElementById(styleId)) {
+                const style = document.createElement('style');
+                style.id = styleId;
+                style.textContent = `
+                    /* 1. 広告・チャット・サイドバーの完全封印 */
+                    #chat, #chat-container, ytd-live-chat-frame, ytd-live-chat-renderer,
+                    #secondary, .ad-container, .ytd-ad-slot-renderer, #masthead-ad,
+                    ytd-companion-slot-renderer, #player-ads { 
+                        display: none !important; 
                     }
-                });
 
-                // 3. 既存のチャット/シアターモード処理（成功しているものは維持）
-                document.querySelectorAll('#chat, #secondary, ytd-live-chat-renderer').forEach(el => el.remove());
-                
-                const btn = document.querySelector('.ytp-size-button');
-                const player = document.querySelector('#movie_player');
-                if (btn && player && !player.classList.contains('ytp-big-mode')) {
-                    btn.click();
-                }
-            };
+                    /* 2. 黒いマージンの正体「columns」の余白を強制排除 */
+                    #columns.ytd-watch-flexy {
+                        margin: 0 !important;
+                        padding: 0 !important;
+                        width: 100% !important;
+                        max-width: 100% !important;
+                        display: flex !important;
+                        justify-content: center !important;
+                    }
 
-            // 実行タイミングの維持
-            setTimeout(applyFix, 1500); 
-            setTimeout(applyFix, 4000); 
-            
-            window.addEventListener('scroll', applyFix, {passive: true});
+                    /* 3. 動画表示エリアの幅を100%に広げる */
+                    #primary.ytd-watch-flexy {
+                        max-width: 100% !important;
+                        min-width: 100% !important;
+                        margin: 0 !important;
+                        padding: 0 !important;
+                    }
+
+                    /* 4. シアターモード時の内部計算を上書き */
+                    ytd-watch-flexy[theater] #primary-inner.ytd-watch-flexy {
+                        margin-right: 0 !important;
+                    }
+                    
+                    /* 5. プレイヤー背後の黒帯を画面端まで広げる */
+                    #player-container-outer.ytd-watch-flexy, 
+                    #player-container-inner.ytd-watch-flexy {
+                        max-width: 100% !important;
+                        margin: 0 !important;
+                    }
+                `;
+                (document.head || document.documentElement).appendChild(style);
+            }
+
+            // シアターモード
+            const btn = document.querySelector('.ytp-size-button');
+            const player = document.querySelector('#movie_player');
+            if (btn && player && !player.classList.contains('ytp-big-mode')) {
+                btn.click();
+            }
         })();
         """
+        # 世界（コンテキスト）を指定せずに実行
         self.browser.page().runJavaScript(js_code)
 
     def _install_proxy_filter(self):

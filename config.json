@@ -7,7 +7,7 @@
     "presets": [
         {
             "name": "デフォルト",
-            "last_url": "https://www.youtube.com/",
+            "last_url": "https://youtube.com/watch?v=lVaCdidMYhs",
             "indicator_styles": {
                 "shape": "rounded_rect",
                 "text_color": "#00FF00",
@@ -26,11 +26,28 @@
             ],
             "locations": [
                 {
-                    "x": 109,
+                    "x": 1090,
+                    "y": 180,
+                    "width": 350,
+                    "height": 670,
+                    "opacity": 1.0,
+                    "is_locked": true
+                },
+                {
+                    "x": 1026,
                     "y": 29,
-                    "width": 1332,
+                    "width": 416,
                     "height": 830,
-                    "opacity": 1.0
+                    "opacity": 1.0,
+                    "is_locked": true
+                },
+                {
+                    "x": 116,
+                    "y": 48,
+                    "width": 1255,
+                    "height": 781,
+                    "opacity": 1.0,
+                    "is_locked": true
                 }
             ]
         }

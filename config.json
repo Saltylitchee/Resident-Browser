@@ -1,30 +1,39 @@
 {
-    "theme_color": "#00ff7f",
+    "app_settings": {
+        "auto_start": false,
+        "last_active_preset_index": 0,
+        "global_indicator_scale": 1.0
+    },
     "presets": [
         {
-            "x": 1090,
-            "y": 180,
-            "width": 350,
-            "height": 670
-        },
-        {
-            "x": 50,
-            "y": 50,
-            "width": 1350,
-            "height": 800
-        },
-        {
-            "x": 990,
-            "y": 25,
-            "width": 450,
-            "height": 830
+            "name": "デフォルト",
+            "last_url": "https://www.youtube.com/",
+            "indicator_styles": {
+                "shape": "rounded_rect",
+                "text_color": "#00FF00",
+                "bg_type": "solid",
+                "bg_color": "#2C3E50",
+                "bg_gradient": [
+                    "#2C3E50",
+                    "#000000"
+                ]
+            },
+            "favorites": [
+                {
+                    "title": "Google",
+                    "url": "https://www.google.com"
+                }
+            ],
+            "locations": [
+                {
+                    "x": 109,
+                    "y": 29,
+                    "width": 1332,
+                    "height": 830,
+                    "opacity": 1.0
+                }
+            ]
         }
     ],
-    "current_preset_index": 2,
-    "url": "https://youtube.com/watch?v=Wz4T8lZg6XE",
-    "favorites": [
-        "https://www.youtube.com",
-        "https://gemini.google.com/app"
-    ],
-    "search_mode": "google"
+    "url": "https://qiita.com/igm50/items/8c9788d4ba5868642c69"
 }

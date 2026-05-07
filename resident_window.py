@@ -50,6 +50,55 @@ bridge = GlobalBridge()
 current_window = None
 _notif = None
 
+class ConfigManager:
+    def __init__(self, filename="config.json"):
+        self.filename = filename
+        self.data = self.load_config()
+
+    def create_default_config(self):
+        """ファイルがない場合に作成されるデフォルトの構造"""
+        default_data = {
+            "app_settings": {
+                "auto_start": False,
+                "last_active_preset_index": 0,
+                "global_indicator_scale": 1.0
+            },
+            "presets": [
+                {
+                    "name": "デフォルト",
+                    "last_url": "https://www.google.com",
+                    "indicator_styles": {
+                        "shape": "rounded_rect",
+                        "text_color": "#FFFFFF",
+                        "bg_type": "solid",
+                        "bg_color": "#2C3E50",
+                        "bg_gradient": ["#2C3E50", "#000000"]
+                    },
+                    "favorites": [
+                        {"title": "Google", "url": "https://www.google.com"}
+                    ],
+                    "locations": [
+                        {"x": 100, "y": 100, "width": 400, "height": 300, "opacity": 0.9}
+                    ]
+                }
+            ]
+        }
+        # ファイルに保存
+        with open(self.filename, 'w', encoding='utf-8') as f:
+            json.dump(default_data, f, indent=4, ensure_ascii=False)
+        return default_data
+    
+    def load_config(self):
+        if os.path.exists(self.filename):
+            with open(self.filename, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        else:
+            return self.create_default_config()
+
+    def save_config(self):
+        with open(self.filename, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, indent=4, ensure_ascii=False)
+
 class FloatingNotification(QWidget):
     def __init__(self, text):
         super().__init__()
@@ -113,27 +162,43 @@ class ClickableLabel(QLabel):
                 self.clicked.emit("title")
             
 class MiniWindow(QMainWindow):
-    def __init__(self, config):
+    def __init__(self, config_manager):  # 引数を config_manager に変更
         super().__init__()
-        # --- 1. まず変数の定義をすべて済ませる（超重要） ---
+        
+        # --- 0. ConfigManagerを自分の中に保持する ---
+        self.config_manager = config_manager
+        # 実データ（辞書）を取り出しておく
+        config_data = self.config_manager.data
+        
+        # --- 1. まず変数の定義をすべて済ませる ---
         self.audio_indicator = None
-        self._current_preset_idx = config.get("current_preset_index", 0)
+        
+        # JSON構造に合わせて取得先を変更（app_settingsから取得）
+        self._current_preset_idx = config_data["app_settings"].get("last_active_preset_index", 0)
         
         # --- 2. UIのセットアップ ---
-        self.setWindowTitle("Resident Mini Window")
+        self.setWindowTitle("Resident Window")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self._setup_browser()
         self._setup_ui()
         
-        # --- 3. シグナルの接続（変数が準備できてから！） ---
+        # --- 3. シグナルの接続 ---
         self.browser.page().recentlyAudibleChanged.connect(self._handle_audio_status)
         self.browser.titleChanged.connect(self._on_title_changed)
         self.browser.loadFinished.connect(self.adjust_zoom)
         self.browser.loadFinished.connect(self.inject_adblock)
+        
         # --- 4. データのロードと表示 ---
-        self.apply_config_geometry(config)
-        if config.get("url"):
-            self.browser.setUrl(QUrl(str(config["url"])))
+        # プリセット情報を取得
+        preset = config_data["presets"][self._current_preset_idx]
+        
+        # ジオメトリ（位置・サイズ）の適用
+        # locations[0] を初期位置とするなどの処理に書き換えが必要かもしれません
+        self.apply_config_geometry() 
+        
+        if preset.get("last_url"):
+            self.browser.setUrl(QUrl(str(preset["last_url"])))
+            
         self._is_transitioning = False
 
     def showEvent(self, event):
@@ -142,31 +207,40 @@ class MiniWindow(QMainWindow):
             self.apply_config_geometry(self.config_at_start)
             del self.config_at_start
 
-    def apply_config_geometry(self, config):
-        # 1. プリセットリストと現在のインデックスを取得
-        presets = config.get("presets", [])
-        idx = config.get("current_preset_index", 0)
-
-        # 2. 指定されたインデックスのプリセットが存在するかチェック
-        if presets and 0 <= idx < len(presets):
-            p = presets[idx]
-            # プリセットから座標を適用
-            self.setGeometry(
-                p.get("x", DEFAULT_CONFIG["x"]),
-                p.get("y", DEFAULT_CONFIG["y"]),
-                p.get("width", DEFAULT_CONFIG["width"]),
-                p.get("height", DEFAULT_CONFIG["height"])
-            )
-            print(f"Applied geometry from preset index: {idx}")
+    def apply_config_geometry(self):
+        """ConfigManagerのデータに基づいてウィンドウ位置・サイズを適用する"""
+        data = self.config_manager.data
+        
+        # 1. app_settings から現在のプリセット番号を取得
+        settings = data.get("app_settings", {})
+        idx = settings.get("last_active_preset_index", 0)
+        
+        # 2. プリセットリストから対象を取得
+        presets = data.get("presets", [])
+        
+        if 0 <= idx < len(presets):
+            preset = presets[idx]
+            locations = preset.get("locations", [])
+            
+            # 3. 現在選択されているロケーション（Alt+Dで切り替えるやつ）を取得
+            loc_idx = getattr(self, 'current_location_index', 0)
+            
+            if 0 <= loc_idx < len(locations):
+                loc = locations[loc_idx]
+                # 座標と透明度を適用
+                self.setGeometry(
+                    loc.get("x", 100),
+                    loc.get("y", 100),
+                    loc.get("width", 400),
+                    loc.get("height", 300)
+                )
+                self.setWindowOpacity(loc.get("opacity", 0.9))
+                print(f"Applied Preset[{idx}] Location[{loc_idx}]")
+            else:
+                print(f"Location index {loc_idx} out of range.")
         else:
-            # 3. プリセットがない場合のフォールバック（従来の挙動）
-            self.setGeometry(
-                config.get("x", DEFAULT_CONFIG["x"]), 
-                config.get("y", DEFAULT_CONFIG["y"]), 
-                config.get("width", DEFAULT_CONFIG["width"]), 
-                config.get("height", DEFAULT_CONFIG["height"])
-            )
-            print("No valid preset found. Applied root/default geometry.")
+            print("Invalid preset index in config.")
+            
         self.adjust_zoom()
 
     def _setup_browser(self):
@@ -482,26 +556,101 @@ class MiniWindow(QMainWindow):
         self.adjust_zoom()
         
     def toggle_window_preset(self):
-        # 1. 一時的にGUIの描画更新をオフにして、計算中の「カクつき」を見せない
+        """Alt + D: 現在のプリセット内で locations リストを巡回する"""
+        # 描画更新を一時停止
         self.setUpdatesEnabled(False)
         
         try:
-            # --- 既存のプリセット切り替えロジック ---
-            config = load_config()
-            presets = config.get("presets", [])
-            self._current_preset_idx = (self._current_preset_idx + 1) % len(presets)
+            # 1. ConfigManagerから最新データを取得
+            data = self.config_manager.data
+            idx = data["app_settings"]["last_active_preset_index"]
+            preset = data["presets"][idx]
+            locations = preset.get("locations", [])
             
-            p = presets[self._current_preset_idx]
-            self.setGeometry(p["x"], p["y"], p["width"], p["height"])
+            if not locations:
+                return
+
+            # 2. ロケーションインデックスを次に進める
+            # self.current_location_index は __init__ で 0 初期化しておく
+            self.current_location_index = (self.current_location_index + 1) % len(locations)
             
-            # 保存処理など
-            config["current_preset_index"] = self._current_preset_idx
-            save_config(config)
+            # 3. 新しい位置・サイズを適用
+            # 先ほど作成した apply_config_geometry を再利用するとコードが重複せず綺麗です
+            self.apply_config_geometry()
+            
+            # 4. 変更を即座に保存
+            self.save_current_state()
+            
+            print(f"Switched to Location Index: {self.current_location_index} in Preset: {preset['name']}")
+            
+        except Exception as e:
+            print(f"Error in toggle_window_preset: {e}")
             
         finally:
-            # 2. 最後に描画をオンに戻して、一気に最新状態を表示
             self.setUpdatesEnabled(True)
-            self.browser.update() # 強制再描画
+            self.browser.update()
+    
+    def save_current_state(self):
+        if not hasattr(self, 'config_manager') or self.config_manager is None:
+            return
+        """現在のウィンドウ位置、サイズ、URLをJSONに保存する"""
+        try:
+            # 1. 現在のプリセットを取得
+            idx = self.config_manager.data["app_settings"]["last_active_preset_index"]
+            preset = self.config_manager.data["presets"][idx]
+
+            # 2. 基本情報の更新
+            preset["last_url"] = self.browser.url().toString()
+
+            # 3. 現在の「位置とサイズ」の保存
+            # ※ Alt+Dで切り替えている最中のインデックス（current_location_indexなど）に合わせる
+            loc_idx = getattr(self, 'current_location_index', 0)
+            
+            # リストの範囲内であることを確認して更新
+            if loc_idx < len(preset["locations"]):
+                geo = self.geometry()
+                preset["locations"][loc_idx] = {
+                    "x": geo.x(),
+                    "y": geo.y(),
+                    "width": geo.width(),
+                    "height": geo.height(),
+                    "opacity": self.windowOpacity()
+                }
+            # 4. ファイルへ書き出し
+            self.config_manager.save_config()
+            
+        # ... 以降の保存処理 ...
+        except Exception as e:
+            print(f"Save failed: {e}")
+        
+    # Alt+D 実行時のメソッド（例：change_location）を修正
+    def change_location(self):
+        # 切り替える前に現在の状態を保存
+        self.save_current_state()
+
+        # --- 既存の切り替えロジック ---
+        self.current_location_index = (self.current_location_index + 1) % len(self.current_locations)
+        loc = self.current_locations[self.current_location_index]
+        self.setGeometry(loc['x'], loc['y'], loc['width'], loc['height'])
+        self.setWindowOpacity(loc.get('opacity', 1.0))
+        # ----------------------------
+
+        # 切り替え後のインデックス状態も保存
+        self.save_current_state()
+        
+    def moveEvent(self, event):
+        # 移動が終わったあとに保存（頻度を下げる場合はタイマーを推奨）
+        super().moveEvent(event)
+        self.save_current_state()
+
+    def resizeEvent(self, event):
+        # リサイズが終わったあとに保存
+        super().resizeEvent(event)
+        self.save_current_state()
+        
+    def closeEvent(self, event):
+        self.save_current_state()
+        super().closeEvent(event)
         
     def _handle_audio_status(self, audible):
         """音が止まってもインジケーターは消さず、状態（アイコン）だけ更新する"""
@@ -532,11 +681,21 @@ class MiniWindow(QMainWindow):
         self.browser.page().runJavaScript(js_code, self._update_indicator_with_state)
 
     def _update_indicator_with_state(self, state):
-        """JSの結果を受けて、アイコン幅固定のレイアウトで表示を確定させる"""
-        config = load_config()
-        color = config.get("theme_color", "#00FF00")
+        """ConfigManagerから最新のスタイル（色・背景・スケール）を読み込んで表示"""
+        # --- 1. データの取得 ---
+        data = self.config_manager.data
+        idx = data["app_settings"]["last_active_preset_index"]
+        preset = data["presets"][idx]
+        styles = preset.get("indicator_styles", {})
+        scale = data["app_settings"].get("global_indicator_scale", 1.0)
 
+        # 設定値の抽出
+        text_color = styles.get("text_color", "#00FF00")
+        bg_color = styles.get("bg_color", "#2C3E50")
+        
+        # --- 2. インジケーターの生成・レイアウト構築 (初回のみ) ---
         if not self.audio_indicator:
+            # ClickableLabel は既存のクラスを使用
             self.audio_indicator = ClickableLabel("", None)
             self.audio_indicator.setWindowFlags(
                 Qt.WindowType.FramelessWindowHint | 
@@ -546,58 +705,69 @@ class MiniWindow(QMainWindow):
             self.audio_indicator.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
             self.audio_indicator.clicked.connect(self._handle_indicator_click)
             
-            # --- レイアウトの構築 (初回のみ) ---
             layout = QHBoxLayout(self.audio_indicator)
-            layout.setContentsMargins(6, 5, 15, 5) # インジケーターの「外枠」と「中身（アイコンや文字）」の間の隙間(左, 上, 右, 下)
-            layout.setSpacing(1) # 「アイコン」と「タイトル文字」の間の "距離"
-            
             self.icon_label = QLabel()
-            self.icon_label.setFixedWidth(30) # アイコンが入る「透明な箱」の幅
-            self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            
             self.text_label = QLabel()
+            self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             
             layout.addWidget(self.icon_label)
             layout.addWidget(self.text_label)
+
+        # --- 3. スタイルの適用 (スケール対応) ---
+        scaled_font_size = int(10 * scale)
+        container_radius = int(5 * scale)
+        icon_width = int(30 * scale)
         
-        self.audio_indicator._current_color = color
+        # コンテナ全体のスタイル（背景色と枠線）
+        container_style = f"""
+            background-color: {bg_color};
+            border: 1px solid {text_color};
+            border-radius: {container_radius}px;
+        """
+        self.audio_indicator.setStyleSheet(container_style)
 
-        # 状態に応じたアイコン設定
+        # ラベルのスタイル（文字色とフォントサイズ）
+        label_style = f"""
+            color: {text_color};
+            font-weight: bold;
+            font-size: {scaled_font_size}pt;
+            background: transparent;
+            border: none;
+        """
+        self.icon_label.setStyleSheet(label_style)
+        self.text_label.setStyleSheet(label_style)
+        
+        self.icon_label.setFixedWidth(icon_width)
+        self.audio_indicator.layout().setContentsMargins(
+            int(6 * scale), int(5 * scale), int(15 * scale), int(5 * scale)
+        )
+
+        # --- 4. 状態に応じたコンテンツの更新 ---
+        # アイコンの決定
         if state == 'playing':
-            icon = "♪" # 再生中のアイコン
+            icon = "♪"
         elif state == 'paused':
-            icon = "||" # 一時停止中のアイコン
+            icon = "||"
         else:
-            icon = "❏" # 動画サイト以外のアイコン
+            icon = "❏"
+        self.icon_label.setText(icon)
 
-        # タイトル整形
+        # タイトルの整形
         raw_title = self.browser.title()
         clean_title = re.sub(r'^\(\d+\)\s*', '', raw_title)
         if not clean_title or clean_title == "about:blank": 
             clean_title = "Resident Mini Window"
 
-        # ラベルに値をセット
-        self.icon_label.setText(icon)
         max_length = 30
-        if len(clean_title) > max_length:
-            display_title = clean_title[:max_length] + "..."
-        else:
-            display_title = clean_title
+        display_title = (clean_title[:max_length] + "...") if len(clean_title) > max_length else clean_title
         self.text_label.setText(display_title)
-        
-        # スタイル適用（背景を透明にしてpaintEventの描画を活かす）
-        label_style = f"color: {color}; font-weight: bold; border: none; background: transparent;"
-        self.icon_label.setStyleSheet(label_style)
-        self.text_label.setStyleSheet(label_style)
 
-        # 全体のサイズを内容に合わせる
+        # --- 5. 配置と表示 ---
         self.audio_indicator.adjustSize()
-
-        # 配置（右下）
         screen_rect = QApplication.primaryScreen().geometry()
         self.audio_indicator.move(
             screen_rect.width() - self.audio_indicator.width() - 10, 
-            screen_rect.height() - 75
+            screen_rect.height() - 80 # タスクバーとの干渉を考慮
         )
         self.audio_indicator.show()
 
@@ -733,41 +903,59 @@ def get_brave_url():
     return None
 
 def on_copy_signal():
+    """Alt + C: URLを取得してJSONの現在のプリセットに保存する"""
+    # 1. 外部関数または小窓自身からURLを取得
     url = get_brave_url()
-    if not url: return
+    if not url:
+        return
 
-    config = load_config()
-    # 既存の座標データを消さないよう、URLだけを更新
-    config["url"] = url
-    save_config(config) # 10個目の save_config 関数を使う
-    show_floating_notify("★URL Updated!")
+    if current_window:
+        # 2. ConfigManager を通じてデータを更新
+        data = current_window.config_manager.data
+        idx = data["app_settings"]["last_active_preset_index"]
+        
+        # 3. 該当プリセットのURLを更新
+        # data["presets"][idx] が存在することを確認
+        if 0 <= idx < len(data["presets"]):
+            data["presets"][idx]["last_url"] = url
+            
+            # 4. 物理ファイルへ保存
+            current_window.config_manager.save_config()
+            
+            # 5. クリップボードにも入れておく（利便性のため）
+            QApplication.clipboard().setText(url)
+            
+            show_floating_notify("★URL Updated & Saved!")
 
 def on_paste_signal():
-    global current_window
-    if not current_window: return
+    """Alt+V: クリップボードのURLをロード、または最後に保存したURLを復元する"""
+    if current_window:
+        # 1. 現在のプリセットと配置データを取得
+        data = current_window.config_manager.data
+        idx = data["app_settings"]["last_active_preset_index"]
+        preset = data["presets"][idx]
+        
+        # 2. 現在のロケーション位置を適用
+        # apply_config_geometry() を呼ぶだけで現在のインデックスに基づいた配置になる
+        current_window.apply_config_geometry()
+        
+        # 3. URLの決定
+        clipboard_text = QApplication.clipboard().text().strip()
+        
+        if clipboard_text.startswith("http"):
+            # クリップボードがURLならそれをロード
+            target_url = clipboard_text
+        else:
+            # クリップボードが空なら、このプリセットで最後に開いていたURLを復元
+            target_url = preset.get("last_url", "https://www.google.com")
+            print(f"Restoring last URL from preset: {target_url}")
 
-    config = load_config()
-    
-    # 1. ジオメトリの適用
-    presets = config.get("presets", [])
-    idx = config.get("current_preset_index", 0)
-
-    if presets and 0 <= idx < len(presets):
-        p = presets[idx]
-        current_window.setGeometry(p["x"], p["y"], p["width"], p["height"])
-    else:
-        current_window.apply_config_geometry(config)
-
-    # 2. URLロード
-    target_url = config.get("url", DEFAULT_CONFIG["url"])
-    current_window.browser.setUrl(QUrl(target_url))
-    
-    # 【追加ポイント】インジケーター状態なら解除して小窓を優先する
-    if current_window.audio_indicator and current_window.audio_indicator.isVisible():
-        current_window.audio_indicator.close()
-
-    # 3. 小窓を表示してアクティブ化
-    QTimer.singleShot(100, current_window.show_and_activate)
+        current_window.browser.setUrl(QUrl(target_url))
+        
+        # 4. ウィンドウを前面に出す
+        current_window.show()
+        current_window.raise_()
+        current_window.activateWindow()
     
 def on_show_signal():
     """Alt+S：現在のウィンドウをそのまま再表示する"""
@@ -827,29 +1015,43 @@ def check_hotkeys():
             bridge.preset_requested.emit()
             last_action_time = now
 
-# ==========================================
-# 4. メイン実行
-# ==========================================
-if __name__ == "__main__":
+def main():
     app = QApplication(sys.argv)
+    # トレイアイコンなどを活用する場合、最後の中を閉じても終了させない
     app.setQuitOnLastWindowClosed(False)
-    # 1. まず設定を読み込む
-    config = load_config()
-    # 2. ウィンドウを作成
-    main_window = MiniWindow(config)
-    # [修正ポイント] ここでの global 宣言を削除！
-    # トップレベル（関数の外）なので、代入するだけでグローバル変数になります。
-    current_window = main_window 
-    # 3. シグナルの配線
+
+    # 1. ConfigManager のインスタンス化 (load_config() を置き換え)
+    config_manager = ConfigManager()
+
+    # 2. ウィンドウを作成 (config_manager を注入)
+    main_window = MiniWindow(config_manager)
+    
+    # 外部（check_hotkeysなど）から参照が必要な場合はグローバルに保持
+    global current_window
+    current_window = main_window
+
+    # 3. シグナルの配線 (Bridge は既存のものを使用)
     bridge.copy_requested.connect(on_copy_signal)
     bridge.paste_requested.connect(on_paste_signal)
     bridge.preset_requested.connect(main_window.toggle_window_preset)
     bridge.show_requested.connect(main_window.toggle_indicator_mode)
     bridge.minimize_requested.connect(main_window.force_indicator_mode)
-    # --- システム系 ---
+
+    # --- システム・監視系 ---
     signal.signal(signal.SIGINT, signal.SIG_DFL)
+    
     monitor_timer = QTimer()
+    # Python の参照保持のため、タイマーを main_window などに紐付けておくと安全
+    monitor_timer.setParent(main_window) 
     monitor_timer.timeout.connect(check_hotkeys)
     monitor_timer.start(50)
+
     print("Watching Alt+C/V/D/S... (Press Ctrl+C to stop)")
+    
+    # メインウィンドウを表示
+    main_window.show()
+    
     sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()

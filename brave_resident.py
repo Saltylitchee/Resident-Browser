@@ -5,6 +5,7 @@ import re
 import json
 import time
 import keyboard
+import webbrowser
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
     QLineEdit, QPushButton, QStatusBar, QMainWindow, QLabel
@@ -119,7 +120,7 @@ class MiniWindow(QMainWindow):
         self._current_preset_idx = config.get("current_preset_index", 0)
         
         # --- 2. UIのセットアップ ---
-        self.setWindowTitle("Resident Mini")
+        self.setWindowTitle("Resident Mini Window")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self._setup_browser()
         self._setup_ui()
@@ -182,47 +183,42 @@ class MiniWindow(QMainWindow):
     def inject_adblock(self):
         js_code = """
         (function() {
-            // 1. 広告消去（最小限のセレクタ）
-            const hideAds = () => {
-                const selectors = ['.ad-container', '.ytd-ad-slot-renderer', '#masthead-ad'];
-                selectors.forEach(s => {
-                    const el = document.querySelector(s);
-                    if (el) el.remove(); // 非表示ではなく削除することで負荷を減らす
+            // 1. 削除対象のリスト（広告、チャット、サイドバー、終了画面の推奨動画）
+            const heavyElements = [
+                '.ad-container', '.ytd-ad-slot-renderer', '#masthead-ad',
+                '#chat', '#chat-container', 'ytd-live-chat-frame', // チャット欄
+                '#secondary', // 関連動画（サイドバー）
+                '.ytp-ce-element' // 動画終了時の推奨動画カード
+            ];
+
+            const cleanup = () => {
+                heavyElements.forEach(selector => {
+                    document.querySelectorAll(selector).forEach(el => el.remove());
                 });
             };
 
-            // 2. シアターモード（無限ループ防止策付き）
+            // 2. シアターモード（フラグ管理でループ防止）
             let theaterDone = false;
             const forceTheater = () => {
-                if (theaterDone) return; // 一度成功したら何もしない
+                if (theaterDone) return;
                 const player = document.querySelector('#movie_player');
                 const btn = document.querySelector('.ytp-size-button');
-                
-                if (player && btn) {
-                    if (!player.classList.contains('ytp-big-mode')) {
-                        btn.click();
-                    }
-                    theaterDone = true; // 実行済みフラグを立てる
+                if (player && btn && !player.classList.contains('ytp-big-mode')) {
+                    btn.click();
+                    theaterDone = true;
                 }
             };
 
-            // 3. 実行制御（監視の頻度を劇的に下げる）
-            hideAds();
-            setTimeout(forceTheater, 2000);
+            // 実行制御
+            cleanup();
+            setTimeout(forceTheater, 1500);
 
-            // 監視は「動画が切り替わった時」などの大きな変化だけに絞る
-            let lastUrl = location.href;
             const observer = new MutationObserver(() => {
-                if (location.href !== lastUrl) {
-                    lastUrl = location.href;
-                    theaterDone = false; // URLが変わったらリセット
-                    setTimeout(forceTheater, 2000);
-                }
-                hideAds();
+                cleanup(); // 要素が追加されたら即削除
             });
+            observer.observe(document.body, { childList: true, subtree: true });
             
-            // 監視対象を限定して負荷を抑える
-            observer.observe(document.body, { childList: true });
+            window.addEventListener('scroll', () => {}, {passive: true});
         })();
         """
         self.browser.page().runJavaScript(js_code)
@@ -378,28 +374,32 @@ class MiniWindow(QMainWindow):
         if not text: return
 
         if self.search_mode == "google":
-            # --- URLかどうかの判定ロジックを追加 ---
             is_url = text.startswith(('http://', 'https://')) or ('.' in text and ' ' not in text)
             
             if is_url:
-                # URLなら直接移動（プロトコル補完）
                 target_url = text if text.startswith(('http://', 'https://')) else f"https://{text}"
+                
+                # --- 【ここが最適な挿入位置】 ---
+                # YouTube LiveのURL判定（live/ だけでなく watch?v= 内のライブも含めるなら調整）
+                if "youtube.com/live/" in target_url or "youtu.be/live/" in target_url:
+                    import webbrowser
+                    webbrowser.open(target_url)
+                    self.search_container.hide() # 検索バーは閉じる
+                    return # 小窓側では遷移させない
+                # ------------------------------
+
                 self.browser.setUrl(QUrl(target_url))
             else:
-                # URLでなければ通常のGoogle検索
                 url = f"https://www.google.com/search?q={text}"
                 self.browser.setUrl(QUrl(url))
             
-            # 検索完了後はバーを隠してブラウザにフォーカスを戻す
             self.search_container.hide()
             self.browser.setFocus()
             
         else:
-            # ページ内検索モード（既存のロジックを維持）
+            # ページ内検索モード
             modifiers = QApplication.keyboardModifiers()
             is_shift = modifiers & Qt.KeyboardModifier.ShiftModifier
-            
-            # Shiftがあれば逆方向
             self._find_with_count(backward=bool(is_shift))
 
     def eventFilter(self, obj, event):

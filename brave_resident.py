@@ -127,6 +127,7 @@ class MiniWindow(QMainWindow):
         self.browser.page().recentlyAudibleChanged.connect(self._handle_audio_status)
         self.browser.titleChanged.connect(self._on_title_changed)
         self.browser.loadFinished.connect(self.adjust_zoom)
+        self.browser.loadFinished.connect(self.inject_adblock)
         
         # --- 4. データのロードと表示 ---
         self.apply_config_geometry(config)
@@ -176,6 +177,33 @@ class MiniWindow(QMainWindow):
         self.browser.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.browser.installEventFilter(self)
         self.page.loadFinished.connect(self._install_proxy_filter)
+        
+    def inject_adblock(self):
+        js_code = """
+        (function() {
+            // --- 広告消去処理 (既存) ---
+            // ...
+
+            // --- シアターモード強制適用 ---
+            const enableTheaterMode = () => {
+                const player = document.querySelector('#movie_player');
+                // シアターモードでない場合、プレイヤーにクラス 'size-full' や 'theater' が欠けている
+                if (player && !player.classList.contains('ytp-big-mode')) {
+                    const theaterButton = document.querySelector('.ytp-size-button');
+                    if (theaterButton) theaterButton.click();
+                }
+            };
+
+            // 初回実行と、ページ遷移（動画切り替え）時にも実行
+            enableTheaterMode();
+            const observer = new MutationObserver(() => {
+                hideAds();
+                enableTheaterMode();
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+        })();
+        """
+        self.browser.page().runJavaScript(js_code)
 
     def _install_proxy_filter(self):
         if self.browser.focusProxy():
@@ -393,7 +421,7 @@ class MiniWindow(QMainWindow):
         if hasattr(self, '_last_zoom_width') and self._last_zoom_width == new_width:
             return
         # base_widthが大きいほどズームアウトして、中身を無理やり収める
-        base_width = 500
+        base_width = 475
         zoom_level = new_width / base_width
         zoom_level = max(0.6, min(zoom_level, 1.2))
         self.browser.setZoomFactor(zoom_level)
@@ -472,8 +500,8 @@ class MiniWindow(QMainWindow):
             
             # --- レイアウトの構築 (初回のみ) ---
             layout = QHBoxLayout(self.audio_indicator)
-            layout.setContentsMargins(10, 5, 10, 5) # インジケーターの「外枠」と「中身（アイコンや文字）」の間の隙間(左, 上, 右, 下)
-            layout.setSpacing(4) # 「アイコン」と「タイトル文字」の間の "距離"
+            layout.setContentsMargins(6, 5, 15, 5) # インジケーターの「外枠」と「中身（アイコンや文字）」の間の隙間(左, 上, 右, 下)
+            layout.setSpacing(1) # 「アイコン」と「タイトル文字」の間の "距離"
             
             self.icon_label = QLabel()
             self.icon_label.setFixedWidth(30) # アイコンが入る「透明な箱」の幅

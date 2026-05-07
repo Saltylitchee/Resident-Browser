@@ -43,6 +43,7 @@ class GlobalBridge(QObject):
     paste_requested = pyqtSignal()
     show_requested = pyqtSignal()
     preset_requested = pyqtSignal()
+    minimize_requested = pyqtSignal()
 
 bridge = GlobalBridge()
 current_window = None
@@ -181,26 +182,47 @@ class MiniWindow(QMainWindow):
     def inject_adblock(self):
         js_code = """
         (function() {
-            // --- 広告消去処理 (既存) ---
-            // ...
+            // 1. 広告消去（最小限のセレクタ）
+            const hideAds = () => {
+                const selectors = ['.ad-container', '.ytd-ad-slot-renderer', '#masthead-ad'];
+                selectors.forEach(s => {
+                    const el = document.querySelector(s);
+                    if (el) el.remove(); // 非表示ではなく削除することで負荷を減らす
+                });
+            };
 
-            // --- シアターモード強制適用 ---
-            const enableTheaterMode = () => {
+            // 2. シアターモード（無限ループ防止策付き）
+            let theaterDone = false;
+            const forceTheater = () => {
+                if (theaterDone) return; // 一度成功したら何もしない
                 const player = document.querySelector('#movie_player');
-                // シアターモードでない場合、プレイヤーにクラス 'size-full' や 'theater' が欠けている
-                if (player && !player.classList.contains('ytp-big-mode')) {
-                    const theaterButton = document.querySelector('.ytp-size-button');
-                    if (theaterButton) theaterButton.click();
+                const btn = document.querySelector('.ytp-size-button');
+                
+                if (player && btn) {
+                    if (!player.classList.contains('ytp-big-mode')) {
+                        btn.click();
+                    }
+                    theaterDone = true; // 実行済みフラグを立てる
                 }
             };
 
-            // 初回実行と、ページ遷移（動画切り替え）時にも実行
-            enableTheaterMode();
+            // 3. 実行制御（監視の頻度を劇的に下げる）
+            hideAds();
+            setTimeout(forceTheater, 2000);
+
+            // 監視は「動画が切り替わった時」などの大きな変化だけに絞る
+            let lastUrl = location.href;
             const observer = new MutationObserver(() => {
+                if (location.href !== lastUrl) {
+                    lastUrl = location.href;
+                    theaterDone = false; // URLが変わったらリセット
+                    setTimeout(forceTheater, 2000);
+                }
                 hideAds();
-                enableTheaterMode();
             });
-            observer.observe(document.body, { childList: true, subtree: true });
+            
+            // 監視対象を限定して負荷を抑える
+            observer.observe(document.body, { childList: true });
         })();
         """
         self.browser.page().runJavaScript(js_code)
@@ -370,6 +392,8 @@ class MiniWindow(QMainWindow):
         if event.type() == QEvent.Type.KeyPress:
             key = event.key()
             modifiers = event.modifiers()
+            
+            # --- Alt キーとの組み合わせ ---
             if modifiers & Qt.KeyboardModifier.AltModifier:
                 if key == Qt.Key.Key_Left:
                     self.browser.back()
@@ -377,9 +401,17 @@ class MiniWindow(QMainWindow):
                 elif key == Qt.Key.Key_Right:
                     self.browser.forward()
                     return True
+                # 【新規追加】Alt + W でインジケーター化（または終了）
+                elif key == Qt.Key.Key_W:
+                    self._show_indicator() # または既存の close_mini_window()
+                    return True
+            
+            # エンターキーの処理
             if obj == self.search_bar and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 self._handle_search_enter()
-                return True # イベントをここで消費
+                return True 
+
+            # --- Control キーとの組み合わせ ---
             if modifiers & Qt.KeyboardModifier.ControlModifier:
                 if key == Qt.Key.Key_F:
                     if self.search_container.isVisible():
@@ -390,13 +422,15 @@ class MiniWindow(QMainWindow):
                         self.search_bar.setFocus()
                         self.search_bar.selectAll()
                     return True
-                elif key == Qt.Key.Key_W:
-                    self.close_mini_window()
+                elif key == Qt.Key.Key_R:  # 【新規追加】
+                    self.browser.reload()
                     return True
+                
             if key == Qt.Key.Key_Escape and self.search_container.isVisible():
                 self.search_container.hide()
                 self.browser.setFocus()
                 return True
+                
         return super().eventFilter(obj, event)
     
     def contextMenuEvent(self, event):
@@ -421,7 +455,7 @@ class MiniWindow(QMainWindow):
         if hasattr(self, '_last_zoom_width') and self._last_zoom_width == new_width:
             return
         # base_widthが大きいほどズームアウトして、中身を無理やり収める
-        base_width = 475
+        base_width = 480
         zoom_level = new_width / base_width
         zoom_level = max(0.6, min(zoom_level, 1.2))
         self.browser.setZoomFactor(zoom_level)
@@ -609,6 +643,16 @@ class MiniWindow(QMainWindow):
             # 2. 小窓が表示されているなら、小窓を隠してからインジケーターを出す
             self.hide() # ← ここが重要！
             self._show_indicator()
+            
+    def force_indicator_mode(self):
+        """Alt+W用：既にインジケーターなら何もしない、小窓ならインジケーター化する"""
+        # インジケーターが表示中なら、何もしない（トグルさせない）
+        if self.audio_indicator and self.audio_indicator.isVisible():
+            return
+        
+        # 小窓が出ているなら隠してインジケーター化
+        self.hide()
+        self._show_indicator()
 
     def _hide_audio_indicator(self):
         if self.audio_indicator:
@@ -693,7 +737,7 @@ def on_paste_signal():
         current_window.audio_indicator.close()
 
     # 3. 小窓を表示してアクティブ化
-    current_window.show_and_activate()
+    QTimer.singleShot(100, current_window.show_and_activate)
     
 def on_show_signal():
     """Alt+S：現在のウィンドウをそのまま再表示する"""
@@ -733,19 +777,22 @@ def check_hotkeys():
     if now - last_action_time < 0.3: return
     
     if keyboard.is_pressed('alt'):
-        # Shiftが押されているか確認
         is_shift = keyboard.is_pressed('shift')
         
-        if keyboard.is_pressed('c'):
+        # 【新規追加】Alt + W
+        if keyboard.is_pressed('w'):
+            bridge.minimize_requested.emit() # インジケーター化信号
+            last_action_time = now
+        elif keyboard.is_pressed('c'):
             bridge.copy_requested.emit()
             last_action_time = now
         elif keyboard.is_pressed('v'):
             bridge.paste_requested.emit()
             last_action_time = now
-        elif keyboard.is_pressed('s') and not is_shift: # ★Shiftが押されていない時だけ実行
+        elif keyboard.is_pressed('s') and not is_shift:
             bridge.show_requested.emit()
             last_action_time = now
-        elif keyboard.is_pressed('d') and not is_shift: # Alt + D
+        elif keyboard.is_pressed('d') and not is_shift:
             bridge.preset_requested.emit()
             last_action_time = now
 
@@ -767,6 +814,7 @@ if __name__ == "__main__":
     bridge.paste_requested.connect(on_paste_signal)
     bridge.show_requested.connect(main_window.toggle_indicator_mode)
     bridge.preset_requested.connect(main_window.toggle_window_preset)
+    bridge.minimize_requested.connect(main_window.force_indicator_mode)
     # --- システム系 ---
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     monitor_timer = QTimer()

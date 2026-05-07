@@ -129,11 +129,11 @@ class MiniWindow(QMainWindow):
         self.browser.titleChanged.connect(self._on_title_changed)
         self.browser.loadFinished.connect(self.adjust_zoom)
         self.browser.loadFinished.connect(self.inject_adblock)
-        
         # --- 4. データのロードと表示 ---
         self.apply_config_geometry(config)
         if config.get("url"):
             self.browser.setUrl(QUrl(str(config["url"])))
+        self._is_transitioning = False
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -373,19 +373,33 @@ class MiniWindow(QMainWindow):
             self.hit_label.setText("0/0")
 
     def _handle_search_enter(self):
-        """Enterキーで検索実行（Shift併用で逆方向）"""
-        text = self.search_bar.text()
+        """Enterキーで検索実行（Shift併用で逆方向）/ Googleモード時はURL判定"""
+        text = self.search_bar.text().strip()
         if not text: return
 
         if self.search_mode == "google":
-            url = f"https://www.google.com/search?q={text}"
-            self.browser.setUrl(QUrl(url))
+            # --- URLかどうかの判定ロジックを追加 ---
+            is_url = text.startswith(('http://', 'https://')) or ('.' in text and ' ' not in text)
+            
+            if is_url:
+                # URLなら直接移動（プロトコル補完）
+                target_url = text if text.startswith(('http://', 'https://')) else f"https://{text}"
+                self.browser.setUrl(QUrl(target_url))
+            else:
+                # URLでなければ通常のGoogle検索
+                url = f"https://www.google.com/search?q={text}"
+                self.browser.setUrl(QUrl(url))
+            
+            # 検索完了後はバーを隠してブラウザにフォーカスを戻す
+            self.search_container.hide()
+            self.browser.setFocus()
+            
         else:
-            # Shiftキーが押されているか判定
+            # ページ内検索モード（既存のロジックを維持）
             modifiers = QApplication.keyboardModifiers()
             is_shift = modifiers & Qt.KeyboardModifier.ShiftModifier
             
-            # Shiftがあれば逆方向（backward=True）
+            # Shiftがあれば逆方向
             self._find_with_count(backward=bool(is_shift))
 
     def eventFilter(self, obj, event):
@@ -402,9 +416,9 @@ class MiniWindow(QMainWindow):
                     self.browser.forward()
                     return True
                 # 【新規追加】Alt + W でインジケーター化（または終了）
-                elif key == Qt.Key.Key_W:
-                    self._show_indicator() # または既存の close_mini_window()
-                    return True
+                # elif key == Qt.Key.Key_W:
+                #     self._show_indicator() # または既存の close_mini_window()
+                #     return True
             
             # エンターキーの処理
             if obj == self.search_bar and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -634,25 +648,41 @@ class MiniWindow(QMainWindow):
             self.audio_indicator.hide()
             
     def toggle_indicator_mode(self):
-        """Alt+S 用：状態を見て小窓とインジケーターを切り替える"""
-        # 1. すでにインジケーターが表示されているなら、小窓に戻す
-        if self.audio_indicator and self.audio_indicator.isVisible():
-            self.audio_indicator.close()
-            self.show_and_activate()
-        else:
-            # 2. 小窓が表示されているなら、小窓を隠してからインジケーターを出す
-            self.hide() # ← ここが重要！
-            self._show_indicator()
+        if self._is_transitioning: return # 処理中なら無視
+        self._is_transitioning = True
+        
+        try:
+            # 既存のトグル処理
+            if self.audio_indicator and self.audio_indicator.isVisible():
+                self.audio_indicator.close()
+                # ここも QTimer で少し余裕を持たせる
+                QTimer.singleShot(100, self.show_and_activate)
+            else:
+                self.hide()
+                self._show_indicator()
+        finally:
+            # 0.5秒後にフラグを下ろす（重いサイト対策）
+            QTimer.singleShot(500, self._reset_transition_flag)
+
+    def _reset_transition_flag(self):
+        self._is_transitioning = False
             
     def force_indicator_mode(self):
-        """Alt+W用：既にインジケーターなら何もしない、小窓ならインジケーター化する"""
-        # インジケーターが表示中なら、何もしない（トグルさせない）
+        """Alt+W用：既にインジケーターなら何もしない、小窓なら確実にインジケーター化する"""
+        if self._is_transitioning: return
+        
+        # すでにインジケーターが表示中なら、重複処理を避けるために何もしない
         if self.audio_indicator and self.audio_indicator.isVisible():
             return
-        
-        # 小窓が出ているなら隠してインジケーター化
-        self.hide()
-        self._show_indicator()
+
+        self._is_transitioning = True
+        try:
+            # 小窓を隠してインジケーターを表示
+            self.hide()
+            self._show_indicator()
+        finally:
+            # 0.5秒後にフラグをリセット（連打防止）
+            QTimer.singleShot(500, self._reset_transition_flag)
 
     def _hide_audio_indicator(self):
         if self.audio_indicator:
@@ -781,16 +811,17 @@ def check_hotkeys():
         
         # 【新規追加】Alt + W
         if keyboard.is_pressed('w'):
-            bridge.minimize_requested.emit() # インジケーター化信号
+            bridge.minimize_requested.emit() # 信号を送る
+            last_action_time = now
+        # Alt + S (トグル切り替え)
+        elif keyboard.is_pressed('s') and not is_shift:
+            bridge.show_requested.emit() # 信号を送る
             last_action_time = now
         elif keyboard.is_pressed('c'):
             bridge.copy_requested.emit()
             last_action_time = now
         elif keyboard.is_pressed('v'):
             bridge.paste_requested.emit()
-            last_action_time = now
-        elif keyboard.is_pressed('s') and not is_shift:
-            bridge.show_requested.emit()
             last_action_time = now
         elif keyboard.is_pressed('d') and not is_shift:
             bridge.preset_requested.emit()
@@ -812,8 +843,8 @@ if __name__ == "__main__":
     # 3. シグナルの配線
     bridge.copy_requested.connect(on_copy_signal)
     bridge.paste_requested.connect(on_paste_signal)
-    bridge.show_requested.connect(main_window.toggle_indicator_mode)
     bridge.preset_requested.connect(main_window.toggle_window_preset)
+    bridge.show_requested.connect(main_window.toggle_indicator_mode)
     bridge.minimize_requested.connect(main_window.force_indicator_mode)
     # --- システム系 ---
     signal.signal(signal.SIGINT, signal.SIG_DFL)

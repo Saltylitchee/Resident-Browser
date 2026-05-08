@@ -1,0 +1,20 @@
+{
+    "youtube.com": {
+        "hide_elements": [
+            "#chat", "#chat-container", "ytd-live-chat-frame",
+            "ytd-live-chat-renderer", ".ad-container",
+            ".ytd-ad-slot-renderer", "#masthead-ad",
+            "ytd-companion-slot-renderer", "#player-ads",
+            "#secondary", "#comments", "ytd-merch-shelf-renderer"
+        ],
+        "injected_css": "html, body { overflow-x: hidden !important; width: 100% !important; margin: 0 !important; } #columns.ytd-watch-flexy { margin: 0 !important; padding: 0 !important; width: 100% !important; max-width: 100% !important; display: block !important; } #primary.ytd-watch-flexy { max-width: 100% !important; min-width: 100% !important; margin: 0 !important; padding: 0 !important; } #primary-inner.ytd-watch-flexy { padding-left: 24px !important; padding-right: 24px !important; box-sizing: border-box !important; } #player-container-outer.ytd-watch-flexy, #player-container-inner.ytd-watch-flexy { max-width: 100% !important; margin: 0 !important; } #movie_player { left: 0 !important; } #page-manager { margin-top: 56px !important; }",
+        "action_selectors": {}
+    },
+    "twitch.tv": {
+        "hide_elements": [ ".video-ads", ".chat-room" ],
+        "injected_css": "...",
+        "action_selectors": {
+            "theater_mode": ".qa-theater-mode-button"
+        }
+    }
+}

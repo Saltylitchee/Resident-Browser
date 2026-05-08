@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# ブラウザのプロファイルデータ（ログイン情報など）を無視
+portal_profile/
+
+# Pythonのキャッシュ
+__pycache__/
+*.pyc
+
+# 仮想環境
+.venv/
+venv/
+
+# 設定ファイル（ローカルで保持したい場合）
+config.json

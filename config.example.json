@@ -1,0 +1,5 @@
+{
+    "browser_path": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "selectors_url": "https://raw.githubusercontent.com/あなたのユーザー名/リポジトリ名/main/selectors.json",
+    "note": "このファイルを config.json にコピーし、自分の環境に合わせてパスやURLを書き換えてください。"
+}

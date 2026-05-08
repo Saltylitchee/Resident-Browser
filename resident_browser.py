@@ -143,43 +143,40 @@ class SelectorManager:
     def __init__(self, local_path="selectors.json", remote_url=None):
         self.local_path = local_path
         self.remote_url = remote_url
-        self.selectors = {}
-        
-        # 1. まずローカルファイルを読み込む
-        self._load_local()
-        
-        # 2. リモートURLが設定されていれば更新を試みる
+        self.selectors = self._load_selectors()
+
+    def _load_selectors(self):
+        """起動時にセレクタを読み込むメインロジック"""
+        # 1. リモート設定があり、かつ開発モード（null）でない場合のみ通信
         if self.remote_url:
-            self.update_from_remote()
-
-    def _load_local(self):
-        """ローカルのselectors.jsonを読み込む"""
-        if os.path.exists(self.local_path):
             try:
-                with open(self.local_path, 'r', encoding='utf-8') as f:
-                    self.selectors = json.load(f)
+                print(f"Fetching latest selectors from: {self.remote_url}")
+                response = requests.get(self.remote_url, timeout=5)
+                if response.status_code == 200:
+                    new_data = response.json()
+                    # 取得成功したらローカルを上書き保存（キャッシュ）
+                    self._save_local(new_data)
+                    return new_data
             except Exception as e:
-                print(f"Failed to load local selectors: {e}")
+                print(f"Remote sync failed ({e}). Using local file.")
 
-    def update_from_remote(self):
-        """リモートから最新のセレクタを取得してローカルを更新する"""
+        # 2. リモート設定がない、あるいは通信失敗時はローカルを読み込む
+        return self._load_local_file()
+
+    def _load_local_file(self):
+        """ローカルファイルから読み込む内部用メソッド"""
         try:
-            # タイムアウトを設定して起動を妨げないようにする
-            response = requests.get(self.remote_url, timeout=5)
-            response.raise_for_status() # 200 OK 以外は例外を投げる
-            
-            new_selectors = response.json()
-            
-            # 内容が正しいか簡易チェック（辞書形式か）
-            if isinstance(new_selectors, dict):
-                self.selectors = new_selectors
-                # ローカルファイルにキャッシュとして保存
-                with open(self.local_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.selectors, f, indent=4, ensure_ascii=False)
-                print("Selectors updated from remote.")
+            if os.path.exists(self.local_path):
+                with open(self.local_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
         except Exception as e:
-            # オフラインや404エラーでも、ローカル版があるためアプリは続行可能
-            print(f"Remote selector update failed (using local cache): {e}")
+            print(f"Failed to load local file: {e}")
+        return {}
+
+    def _save_local(self, data):
+        """ローカルファイルに保存する内部用メソッド"""
+        with open(self.local_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
 
     def get_data_for_url(self, url):
         """URLからドメインを判別し、対応する設定を返す"""
@@ -187,7 +184,7 @@ class SelectorManager:
             if domain in url:
                 return data
         return None
-
+    
 class FloatingNotification(QWidget):
     def __init__(self, text):
         super().__init__()
@@ -1276,13 +1273,25 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    # --- 1. インスタンス化は一度だけ行う ---
-    config_manager = ConfigManager()
+    # 1. ConfigManagerのインスタンス化
+    config_manager = ConfigManager("config.json") 
     
-    # 今はローカルのみを使用（remote_urlはNone）
-    selector_manager = SelectorManager(local_path="selectors.json", remote_url=None)
+    # 2. 【ここを修正】 self.data にアクセスする
+    config_dict = config_manager.data 
 
-    # --- 2. Windowを作成し、グローバル変数に登録 ---
+    # 3. 階層を辿って URL を取得
+    # config.json の app_settings -> selectors_url を参照
+    app_settings = config_dict.get("app_settings", {})
+    remote_url = app_settings.get("selectors_url")
+
+    # 4. SelectorManager の初期化
+    selector_manager = SelectorManager(
+        local_path="selectors.json", 
+        remote_url=remote_url
+    )
+
+    # --- 2. Windowを作成 ---
+    # インスタンス化したマネージャーたちを渡す
     main_window = ResidentWindow(config_manager, selector_manager)
     
     global current_window
@@ -1305,9 +1314,7 @@ def main():
 
     print("Watching Alt+C/V/D/S... (Press Ctrl+C to stop)")
     
-    # メインウィンドウを表示
     main_window.show()
-    
     sys.exit(app.exec())
 
 if __name__ == "__main__":

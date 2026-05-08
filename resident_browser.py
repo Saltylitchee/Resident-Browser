@@ -9,14 +9,16 @@ import traceback
 import shutil
 import requests
 from datetime import datetime
+from urllib.parse import urlparse
+from enum import Enum, auto
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QStatusBar, QMainWindow, QLabel
 )
 from PyQt6.QtCore import (
-    Qt, QUrl, QEvent, QTimer, QObject, pyqtSignal
+    Qt, QUrl, QEvent, QTimer, QObject, pyqtSignal, QPropertyAnimation, QEasingCurve, QPoint
 )
-from PyQt6.QtGui import QCursor, QFont, QPainter, QBrush, QColor, QPen, QShortcut, QKeySequence
+from PyQt6.QtGui import QCursor, QFont, QPainter, QBrush, QColor, QPen, QShortcut, QKeySequence, QScreen
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
 
@@ -27,47 +29,52 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 PROFILE_DIR = os.path.join(BASE_DIR, "portal_profile")
 
-# 初期値やセーフティ情報をここに集約
-DEFAULT_CONFIG = {
-    "x": 990,
-    "y": 25,
-    "width": 450,
-    "height": 830,
-    "url": "https://www.google.com",
-    "favorites": ["https://www.youtube.com", "https://gemini.google.com/app"]
-}
-
 JS_COPY_SCRIPT = "window.getSelection().toString();"
 
 # ==========================================
 # 2. クラス定義
 # ==========================================
-class GlobalBridge(QObject):
+class Bridge(QObject):
     copy_requested = pyqtSignal()
     paste_requested = pyqtSignal()
     show_requested = pyqtSignal()
-    preset_requested = pyqtSignal()
-    minimize_requested = pyqtSignal()
+    hide_completely_requested = pyqtSignal()
+    cycle_geometry_requested = pyqtSignal() 
+    # Alt + 1~9 用（プリセット自体の切り替え）
+    # int を引数に取ることで、どの番号が押されたかを受け渡せます
+    preset_switch_requested = pyqtSignal(int)
 
-bridge = GlobalBridge()
+bridge = Bridge()
 current_window = None
 _notif = None
 
+class DisplayMode(Enum):
+    EXPANDED = auto()   # 小窓
+    COLLAPSED = auto()  # インジケーター
+    HIDDEN = auto()     # 潜伏
+
 class ConfigManager:
-    # 常に最新・完全な構造をデフォルトとして定義
+    # --- 1. スキーマの定義（唯一の正解とする） ---
     DEFAULT_CONFIG = {
         "app_settings": {
             "auto_start": False,
             "last_active_preset_index": 0,
             "global_indicator_scale": 1.0,
+            "selectors_url": None,  # セレクタ管理との連携用
+            "search_mode": "google",
             "developer_notes": {
-                "reference_url": "https://qiita.com/igm50/items/8c9788d4ba5868642c69"
+                "reference_url": "https://gemini.google.com/app",
+                "last_modified": "2026-05-08" # メタデータとして役立ちます
             }
         },
         "presets": [
             {
                 "name": "デフォルト",
                 "last_url": "https://www.google.com",
+                "favorites": [
+                    "https://www.youtube.com",
+                    "https://gemini.google.com/app"
+                ],
                 "base_width": 500,
                 "indicator_styles": {
                     "shape": "rounded_rect",
@@ -77,7 +84,7 @@ class ConfigManager:
                     "bg_gradient": ["#2C3E50", "#000000"]
                 },
                 "locations": [
-                    { "x": 100, "y": 100, "width": 400, "height": 300, "opacity": 1.0, "is_locked": False }
+                    { "x": 100, "y": 100, "width": 400, "height": 300, "opacity": 1.0, "is_locked": True }
                 ]
             }
         ]
@@ -85,59 +92,58 @@ class ConfigManager:
 
     def __init__(self, config_path="config.json"):
         self.config_path = config_path
+        # 初期化時に読み込みと整合性チェックを完結させる
         self.data = self.load_config()
 
+    # --- 2. 読み込みロジックの改善 ---
     def load_config(self):
-        """ファイルを読み込み、デフォルト値で補完（マージ）して返す"""
         if not os.path.exists(self.config_path):
-            self.save_default_config()
-            return self.DEFAULT_CONFIG.copy()
+            return self.save_default_config()
 
         try:
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 loaded_data = json.load(f)
             
-            # ロードしたデータに不足があれば、デフォルト値から再帰的にマージ
+            # デフォルト構造をベースに、ロードしたデータを上書き
+            # これにより、プログラム更新で新しい設定項目が増えても、既存ファイルが壊れません
             return self._deep_merge(self.DEFAULT_CONFIG.copy(), loaded_data)
 
         except (json.JSONDecodeError, Exception) as e:
-            print(f"Config corruption detected: {e}")
+            print(f"[Config] Corruption detected: {e}")
             self._backup_corrupted_config()
-            self.save_default_config()
-            return self.DEFAULT_CONFIG.copy()
+            return self.save_default_config()
 
     def _deep_merge(self, base, update):
-        """
-        再帰的に辞書をマージする核心ロジック。
-        baseにあるキーがupdateになければ補完し、辞書同士ならさらに深く潜る。
-        """
+        """再帰的に辞書をマージし、古い設定ファイルに新機能のキーを補完する"""
         for key, value in update.items():
             if key in base and isinstance(base[key], dict) and isinstance(value, dict):
                 self._deep_merge(base[key], value)
             else:
+                # リスト（presetsなど）の場合は、単純上書きでも良いですが、
+                # 将来的に「リスト内の要素数」が変わる場合はここを拡張します。
                 base[key] = value
         return base
 
     def _backup_corrupted_config(self):
-        """壊れたファイルを調査用にリネームして保存"""
         if os.path.exists(self.config_path):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_path = f"{self.config_path}_{timestamp}.bak"
             shutil.copy(self.config_path, backup_path)
-            print(f"Corrupted config backed up to: {backup_path}")
+            print(f"[Config] Backup saved to: {backup_path}")
 
     def save_config(self):
-        """現在の self.data をファイルに保存"""
         try:
+            # 保存前にディレクトリチェック（Windows環境での安定性のため）
+            os.makedirs(os.path.dirname(os.path.abspath(self.config_path)), exist_ok=True)
             with open(self.config_path, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, indent=4, ensure_ascii=False)
         except Exception as e:
-            print(f"Failed to save config: {e}")
+            print(f"[Config] Save failed: {e}")
 
     def save_default_config(self):
-        """デフォルト設定をファイルに書き出す"""
         self.data = self.DEFAULT_CONFIG.copy()
         self.save_config()
+        return self.data
         
 class SelectorManager:
     def __init__(self, local_path="selectors.json", remote_url=None):
@@ -146,42 +152,51 @@ class SelectorManager:
         self.selectors = self._load_selectors()
 
     def _load_selectors(self):
-        """起動時にセレクタを読み込むメインロジック"""
-        # 1. リモート設定があり、かつ開発モード（null）でない場合のみ通信
+        """起動時にセレクタを読み込む（リモート優先 ⇄ ローカルフォールバック）"""
         if self.remote_url:
             try:
-                print(f"Fetching latest selectors from: {self.remote_url}")
-                response = requests.get(self.remote_url, timeout=5)
+                # タイムアウトを短めに設定し、起動を妨げないようにする
+                response = requests.get(self.remote_url, timeout=3)
                 if response.status_code == 200:
                     new_data = response.json()
-                    # 取得成功したらローカルを上書き保存（キャッシュ）
                     self._save_local(new_data)
                     return new_data
             except Exception as e:
-                print(f"Remote sync failed ({e}). Using local file.")
-
-        # 2. リモート設定がない、あるいは通信失敗時はローカルを読み込む
+                print(f"[SelectorManager] Remote sync failed: {e}. Using local cache.")
+        
         return self._load_local_file()
 
     def _load_local_file(self):
-        """ローカルファイルから読み込む内部用メソッド"""
         try:
             if os.path.exists(self.local_path):
                 with open(self.local_path, 'r', encoding='utf-8') as f:
                     return json.load(f)
         except Exception as e:
-            print(f"Failed to load local file: {e}")
+            print(f"[SelectorManager] Failed to load local file: {e}")
         return {}
 
     def _save_local(self, data):
-        """ローカルファイルに保存する内部用メソッド"""
-        with open(self.local_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        try:
+            with open(self.local_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"[SelectorManager] Failed to save cache: {e}")
 
     def get_data_for_url(self, url):
-        """URLからドメインを判別し、対応する設定を返す"""
-        for domain, data in self.selectors.items():
-            if domain in url:
+        """URLからドメインを抽出し、正確にマッチングさせる"""
+        if not self.selectors:
+            return None
+        
+        # URLから純粋なホスト名（例: www.youtube.com）を取得
+        try:
+            parsed_url = urlparse(url)
+            hostname = parsed_url.netloc
+        except:
+            return None
+
+        # ドメインの部分一致判定を少し厳格にする
+        for domain_key, data in self.selectors.items():
+            if domain_key in hostname:
                 return data
         return None
     
@@ -247,31 +262,26 @@ class ClickableLabel(QLabel):
             else:
                 self.clicked.emit("title")
             
-class ResidentWindow(QMainWindow):
+class ResidentMiniPlayer(QMainWindow):
     def __init__(self, config_manager, selector_manager):
         super().__init__()
         self.config_manager = config_manager
         self.selector_manager = selector_manager # ここで保持する
+        self.current_mode = DisplayMode.EXPANDED
         self.current_location_index = 0
-        # 実データ（辞書）を取り出しておく
         config_data = self.config_manager.data
-        
         # --- 1. まず変数の定義をすべて済ませる ---
-        self.audio_indicator = None
-        
+        self.collapsed_indicator = None
         # JSON構造に合わせて取得先を変更（app_settingsから取得）
         self._current_preset_idx = config_data["app_settings"].get("last_active_preset_index", 0)
-        
         # --- 2. UIのセットアップ ---
         self.setWindowTitle("Resident Browser")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self._setup_browser()
         self._setup_ui()
-        
         # --- 3. シグナルの接続 ---
         self.browser.page().recentlyAudibleChanged.connect(self._handle_audio_status)
         self.browser.titleChanged.connect(self._on_title_changed)
-        
         # loadFinished だけでなく、URL変更時にもJSを注入する
         self.browser.loadFinished.connect(self.inject_adblock)
         self.browser.urlChanged.connect(lambda: self.inject_adblock()) 
@@ -284,12 +294,218 @@ class ResidentWindow(QMainWindow):
         self.apply_config_geometry() 
         if preset.get("last_url"):
             self.browser.setUrl(QUrl(str(preset["last_url"])))
-        self._is_transitioning = False
+        self._is_switching_mode = False
         self.all_selectors = {}
         self.load_selectors() # 起動時に一度読み込む
         self.reload_shortcut = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
         self.reload_shortcut.activated.connect(self.reload_and_apply)
         self.browser.loadFinished.connect(self._on_load_finished)
+        
+    def handle_show_request(self):
+        """
+        Alt+S（表示リクエスト）に対する意思決定。
+        何を表示するか、どのモードにするかはクラス自身が判断する。
+        """
+        if not self.has_valid_content():
+            self.show_floating_notify("No URL to show. Press Alt+C.")
+            return
+
+        # モードのトグル
+        target = (DisplayMode.EXPANDED 
+                if self.current_mode != DisplayMode.EXPANDED 
+                else DisplayMode.COLLAPSED)
+        self.update_display_mode(target)
+        
+    def update_display_mode(self, target_mode: DisplayMode):
+        if self._is_switching_mode: return
+        self._is_switching_mode = True
+
+        try:
+            # 1. 既存表示のクリーンアップ
+            if self.collapsed_indicator:
+                self.collapsed_indicator.hide()
+
+            # 2. ターゲットモードへの遷移
+            if target_mode == DisplayMode.EXPANDED:
+                self.show_and_activate()
+                self.current_mode = DisplayMode.EXPANDED
+
+            elif target_mode == DisplayMode.COLLAPSED:
+                self.hide()
+                self._show_indicator()
+                self.current_mode = DisplayMode.COLLAPSED
+
+            elif target_mode == DisplayMode.HIDDEN:
+                self.hide()
+                self.current_mode = DisplayMode.HIDDEN
+                self.show_floating_notify("★Stealth Mode Activated") # 潜伏したことを通知
+
+        finally:
+            QTimer.singleShot(500, self._reset_transition_flag)
+            
+    def has_valid_content(self):
+        """
+        ブラウザに有効なURLが読み込まれているかチェックする
+        """
+        url = self.browser.url().toString()
+        # 空、about:blank、または初期状態でないことを確認
+        return bool(url) and url != "about:blank" and url != ""
+            
+    def capture_current_url(self):
+        """Alt + C相当：現在のURLをJSONに保存"""
+        url = get_portal_url() # これは外部関数として維持でOK
+        if not url: return
+
+        # セルフ（自分自身）のコンフィグを更新
+        data = self.config_manager.data
+        idx = data["app_settings"]["last_active_preset_index"]
+        
+        if 0 <= idx < len(data["presets"]):
+            data["presets"][idx]["last_url"] = url
+            self.config_manager.save_config()
+            self.show_floating_notify("★Target URL Saved!")
+
+    def apply_url_from_dispatch(self):
+        """Alt + V相当：クリップボードまたは履歴からURLを展開"""
+        data = self.config_manager.data
+        idx = data["app_settings"]["last_active_preset_index"]
+        preset = data["presets"][idx]
+        
+        # 座標適用
+        self.apply_config_geometry()
+        
+        clipboard = QApplication.clipboard()
+        text = clipboard.text().strip()
+        
+        if text.startswith("http"):
+            target_url = text
+            clipboard.clear()
+            self.show_floating_notify("★URL Loaded from Clipboard")
+        else:
+            target_url = preset.get("last_url", "https://www.google.com")
+            self.show_floating_notify("★URL Restored from History")
+
+        self.browser.setUrl(QUrl(target_url))
+        self.update_display_mode(DisplayMode.EXPANDED) # 貼り付けたら即・小窓へ
+        
+    def show_floating_notify(self, text):
+        """
+        現在のプリセット色を取得して通知を表示する。
+        以前のグローバル関数を置き換える。
+        """
+        # 1. 現在のプリセットからテーマ色を取得
+        try:
+            data = self.config_manager.data
+            idx = data["app_settings"].get("last_active_preset_index", 0)
+            color = data["presets"][idx]["indicator_styles"].get("text_color", "#00FF00")
+        except (KeyError, IndexError):
+            color = "#00FF00"
+
+        # 2. 通知インスタンスの生成 (参照を保持しなくても deleteLater で消える)
+        self._last_notification = FloatingNotification(text, color=color)
+        
+        
+        
+        
+    def apply_preset(self, index):
+        """
+        指定されたインデックスのプリセットをアプリ全体に適用する
+        """
+        data = self.config_manager.data
+        # ガード：存在しないインデックスが指定された場合
+        if index >= len(data["presets"]):
+            self.show_floating_notify(f"Preset {index + 1} not defined.")
+            return
+        # 1. 切り替える前に、現在の（古い）プリセットの状態を保存
+        self.save_current_state()
+        # 2. 設定データの更新
+        data["app_settings"]["last_active_preset_index"] = index
+        # プリセットを跨ぐ際、サイズパターンのインデックスは 0（メインサイズ）に戻す
+        self.current_location_index = 0 
+        # 3. UIと外観の同期
+        self.refresh_favorites_ui()       # お気に入りボタン更新
+        self.apply_config_geometry()      # 位置・サイズ更新
+        self.update_indicator_style()     # インジケーターの色更新
+        # 4. コンテンツのロード
+        # プリセットに記録されている最後のURLを復元
+        target_preset = data["presets"][index]
+        last_url = target_preset.get("last_url", "https://www.google.com")
+        self.browser.setUrl(QUrl(last_url))
+        # 5. 設定の永続化
+        self.config_manager.save_config()
+        self.show_floating_notify(f"Switch -> {target_preset['name']}")
+        
+    def update_indicator_style(self):
+        """
+        現在のプリセットに応じたインジケーターのスタイル（色など）を適用
+        """
+        data = self.config_manager.data
+        idx = data["app_settings"].get("last_active_preset_index", 0)
+        
+        # プリセットごとにテーマカラーを持たせる拡張を見越した実装
+        # （現在は暫定で固定、またはプリセット名に応じて色を変える等）
+        preset_name = data["presets"][idx].get("name", "")
+        
+        # 例：特定のワードが含まれていたら色を変える、といった遊び心も可能
+        color = "#3a8fb7" # デフォルト
+        if "YouTube" in preset_name: color = "#ff0000"
+        elif "Work" in preset_name: color = "#2ecc71"
+
+        self.indicator.setStyleSheet(f"""
+            background-color: {color};
+            border-radius: 5px;
+        """)
+        
+        
+        
+        
+    def refresh_favorites_ui(self):
+        """
+        現在のプリセットに基づいてお気に入りボタンを再生成する
+        """
+        # 1. 既存のボタンを安全に削除
+        # レイアウト内のアイテムを後ろから順番に削除していくのがQtの定石です
+        while self.fav_layout.count():
+            item = self.fav_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater() # メモリ解放
+
+        # 2. 現在のプリセット情報を取得
+        config_data = self.config_manager.data
+        idx = config_data["app_settings"].get("last_active_preset_index", 0)
+        
+        try:
+            current_preset = config_data["presets"][idx]
+            favs = current_preset.get("favorites", [])
+            
+            # 3. 新しいボタンを生成して追加
+            for url in favs[:2]:
+                display_text = url.replace("https://", "").replace("www.", "")[0].upper()
+                btn = QPushButton(display_text) 
+                btn.setFixedSize(24, 24)
+                btn.setToolTip(url)
+                btn.setStyleSheet(self._get_fav_btn_style()) # スタイルも共通化
+                btn.clicked.connect(lambda checked, u=url: self.browser.setUrl(QUrl(u)))
+                self.fav_layout.addWidget(btn)
+                
+        except (IndexError, KeyError) as e:
+            print(f"Error refreshing favorites: {e}")
+
+    def _get_fav_btn_style(self):
+        """お気に入りボタンのスタイルを返す（保守性のため分離）"""
+        return """
+            QPushButton {
+                background-color: white; 
+                border: 1px solid #ccc; 
+                border-radius: 3px; 
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #e0e0e0; }
+        """
+        
+        
+        
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -427,14 +643,14 @@ class ResidentWindow(QMainWindow):
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        
+        # --- 検索バーコンテナ ---
         self.search_container = QWidget()
         self.search_container.setStyleSheet("background: #f0f0f0; border-bottom: 1px solid #ccc;")
         self.search_container.setMaximumHeight(40)
         s_layout = QHBoxLayout(self.search_container)
         s_layout.setContentsMargins(5, 2, 5, 2)
         s_layout.setSpacing(5)
-        s_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter) 
+        s_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self.mode_toggle = QPushButton("[G]")
         self.mode_toggle.setFixedSize(30, 24)
@@ -443,6 +659,7 @@ class ResidentWindow(QMainWindow):
         s_layout.addWidget(self.mode_toggle)
 
         self.search_bar = QLineEdit()
+        self.search_bar.installEventFilter(self)
         self.search_bar.setPlaceholderText("Google Search...")
         self.search_bar.returnPressed.connect(self._handle_search_enter)
         s_layout.addWidget(self.search_bar)
@@ -453,18 +670,35 @@ class ResidentWindow(QMainWindow):
         fav_layout.setContentsMargins(0,0,0,0)
         fav_layout.setSpacing(5)
 
-        config = load_config()
-        favs = config.get("favorites", DEFAULT_CONFIG.get("favorites", []))
+        # ConfigManagerから現在のプリセットを取得
+        config_data = self.config_manager.data
+        idx = config_data["app_settings"].get("last_active_preset_index", 0)
         
-        # アイコンURLの直接指定は不可なため、頭文字1文字をボタンにする
-        for url in favs[:2]:
-            display_text = url.replace("https://", "").replace("www.", "")[0].upper() # 頭文字
-            btn = QPushButton(display_text) 
-            btn.setFixedSize(24, 24)
-            btn.setToolTip(url) # ホバーでURLを表示
-            btn.setStyleSheet("background-color: white; border: 1px solid #ccc; border-radius: 3px; font-weight: bold;")
-            btn.clicked.connect(lambda checked, u=url: self.browser.setUrl(QUrl(u)))
-            fav_layout.addWidget(btn)
+        # 範囲チェックを行い安全にプリセットを取得
+        if 0 <= idx < len(config_data["presets"]):
+            current_preset = config_data["presets"][idx]
+            favs = current_preset.get("favorites", [])
+            
+            for url in favs[:2]:  # 上位2つを表示
+                # ドメインの頭文字を取得
+                display_text = url.replace("https://", "").replace("www.", "")[0].upper()
+                btn = QPushButton(display_text) 
+                btn.setFixedSize(24, 24)
+                btn.setToolTip(url)
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: white; 
+                        border: 1px solid #ccc; 
+                        border-radius: 3px; 
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #e0e0e0;
+                    }
+                """)
+                # クロージャの問題を避けるため、デフォルト引数 u=url を使用
+                btn.clicked.connect(lambda checked, u=url: self.browser.setUrl(QUrl(u)))
+                self.fav_layout.addWidget(btn)
         
         s_layout.addWidget(self.fav_group)
 
@@ -502,17 +736,15 @@ class ResidentWindow(QMainWindow):
         self.setStatusBar(self.statusBar)
         self.search_mode = "google"
         
-        config = load_config()
-        saved_mode = config.get("search_mode", "google")
-        
-        # 初期状態を設定
-        self.search_mode = "google" # 一旦デフォルトに
+        # 初期状態の検索モード復元
+        saved_mode = config_data["app_settings"].get("search_mode", "google")
         if saved_mode == "find":
-            # findモードへの切り替え処理を実行
-            self.toggle_search_mode() 
+            self.toggle_search_mode()
         else:
-            # googleモードの初期状態を確定（色は既にセットされているので検索バーの表示等）
             self.search_bar.setPlaceholderText("Google Search...")
+
+        layout.addWidget(self.search_container)
+        layout.addWidget(self.browser)
         
     def toggle_search_mode(self):
         """トグルボタンでモードを切り替える"""
@@ -530,58 +762,32 @@ class ResidentWindow(QMainWindow):
             self.search_bar.setPlaceholderText("Google Search...")
             self.find_group.hide()
             self.fav_group.show()
-        self.save_current_mode()
+        
+        # 修正：ConfigManagerを使用して保存
+        self.config_manager.data["app_settings"]["search_mode"] = self.search_mode
+        self.config_manager.save_config()
+        
         self.search_bar.setFocus()
-        
-    def save_current_mode(self):
-        """現在の検索モードをJSONに書き込む"""
-        config = load_config()
-        config["search_mode"] = self.search_mode
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=4, ensure_ascii=False)
-        
-    # --- 新設：ヒット件数を取得しながら検索する ---
-    def _find_with_count(self, backward=False):
-        text = self.search_bar.text()
-        flags = QWebEnginePage.FindFlag(0)
-        if backward:
-            flags |= QWebEnginePage.FindFlag.FindBackward
-        
-        # 検索実行時にコールバックを登録して件数を受け取る
-        self.browser.findText(text, flags, self._update_hit_count)
-
-    def _update_hit_count(self, result):
-        """検索結果（件数情報）をラベルに反映"""
-        # [修正] 環境に合わせて activeMatch() を使用
-        num_matches = result.numberOfMatches() 
-        active_index = result.activeMatch() # activeMatchIndex から activeMatch へ変更
-
-        if num_matches > 0:
-            current = active_index
-            self.hit_label.setText(f"{current}/{num_matches}")
-        else:
-            self.hit_label.setText("0/0")
 
     def _handle_search_enter(self):
-        """Enterキーで検索実行（Shift併用で逆方向）/ Googleモード時はURL判定"""
+        """Enterキーで検索実行 / URL判定"""
         text = self.search_bar.text().strip()
         if not text: return
 
         if self.search_mode == "google":
+            # URLかどうかの判定
             is_url = text.startswith(('http://', 'https://')) or ('.' in text and ' ' not in text)
             
             if is_url:
                 target_url = text if text.startswith(('http://', 'https://')) else f"https://{text}"
                 
-                # --- 【ここが最適な挿入位置】 ---
-                # YouTube LiveのURL判定（live/ だけでなく watch?v= 内のライブも含めるなら調整）
-                if "youtube.com/live/" in target_url or "youtu.be/live/" in target_url:
+                # YouTube Live等の外部ブラウザ転送判定
+                if any(x in target_url for x in ["youtube.com/live/", "youtu.be/live/"]):
                     import webbrowser
                     webbrowser.open(target_url)
-                    self.search_container.hide() # 検索バーは閉じる
-                    return # 小窓側では遷移させない
-                # ------------------------------
-
+                    self.search_container.hide()
+                    return 
+                
                 self.browser.setUrl(QUrl(target_url))
             else:
                 url = f"https://www.google.com/search?q={text}"
@@ -591,88 +797,131 @@ class ResidentWindow(QMainWindow):
             self.browser.setFocus()
             
         else:
-            # ページ内検索モード
+            # ページ内検索モード（Shift押下で逆方向）
             modifiers = QApplication.keyboardModifiers()
             is_shift = modifiers & Qt.KeyboardModifier.ShiftModifier
             self._find_with_count(backward=bool(is_shift))
+        
+    def _find_with_count(self, backward=False):
+        text = self.search_bar.text()
+        flags = QWebEnginePage.FindFlag(0)
+        if backward:
+            flags |= QWebEnginePage.FindFlag.FindBackward
+        
+        # 検索実行
+        self.browser.findText(text, flags, self._update_hit_count)
+
+    def _update_hit_count(self, result):
+        """検索結果（件数情報）をラベルに反映"""
+        num_matches = result.numberOfMatches() 
+        active_index = result.activeMatch() 
+
+        if num_matches > 0:
+            # インデックスは0開始のため、表示は +1 する
+            self.hit_label.setText(f"{active_index + 1}/{num_matches}")
+        else:
+            self.hit_label.setText("0/0")
 
     def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        from PyQt6.QtGui import QKeyEvent
+        
         if event.type() == QEvent.Type.KeyPress:
             key = event.key()
             modifiers = event.modifiers()
             
-            # --- Alt キーとの組み合わせ ---
+            # --- 1. Control キーとの組み合わせ ---
+            if modifiers & Qt.KeyboardModifier.ControlModifier:
+                # 検索バーのトグル（Ctrl+F）
+                if key == Qt.Key.Key_F:
+                    self.toggle_search_container() # メソッド化して共通利用
+                    return True
+                # リロード（Ctrl+R）
+                elif key == Qt.Key.Key_R:
+                    self.browser.reload()
+                    return True
+
+            # --- 2. Alt キーとの組み合わせ ---
             if modifiers & Qt.KeyboardModifier.AltModifier:
+                # ブラウザバック（Alt+←）
                 if key == Qt.Key.Key_Left:
                     self.browser.back()
                     return True
+                # ブラウザ進む（Alt+→）
                 elif key == Qt.Key.Key_Right:
                     self.browser.forward()
                     return True
-                # 【新規追加】Alt + W でインジケーター化（または終了）
-                # elif key == Qt.Key.Key_W:
-                #     self._show_indicator() # または既存の close_mini_window()
-                #     return True
-            
-            # エンターキーの処理
-            if obj == self.search_bar and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                self._handle_search_enter()
-                return True 
 
-            # --- Control キーとの組み合わせ ---
-            if modifiers & Qt.KeyboardModifier.ControlModifier:
-                if key == Qt.Key.Key_F:
+            # --- 3. 特定ウィジェットに対する個別処理 ---
+            if obj == self.search_bar:
+                # エンターキーで検索実行
+                if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    self._handle_search_enter()
+                    return True
+                # Escapeで検索バーを閉じる
+                elif key == Qt.Key.Key_Escape:
                     if self.search_container.isVisible():
-                        self.search_container.hide()
-                        self.browser.setFocus()
-                    else:
-                        self.search_container.show()
-                        self.search_bar.setFocus()
-                        self.search_bar.selectAll()
-                    return True
-                elif key == Qt.Key.Key_R:  # 【新規追加】
-                    self.browser.reload()
-                    return True
-                
-            if key == Qt.Key.Key_Escape and self.search_container.isVisible():
-                self.search_container.hide()
-                self.browser.setFocus()
-                return True
-                
+                        self.toggle_search_container()
+                        return True
+
         return super().eventFilter(obj, event)
+
+    def toggle_search_container(self):
+        """検索バーの表示・非表示を切り替え、適切にフォーカスを制御する"""
+        if self.search_container.isVisible():
+            self.search_container.hide()
+            self.browser.setFocus()
+        else:
+            self.search_container.show()
+            self.search_bar.setFocus()
+            self.search_bar.selectAll()
     
     def contextMenuEvent(self, event):
         from PyQt6.QtWidgets import QMenu
+        from PyQt6.QtGui import QCursor
         menu = QMenu(self)
-        # スタイルは維持
         menu.setStyleSheet("""
             QMenu { background-color: white; border: 1px solid #999; }
             QMenu::item { padding: 5px 25px; }
             QMenu::item:selected { background-color: #3a8fb7; color: white; }
         """)
-        
+        # 基本操作
         menu.addAction("戻る").triggered.connect(self.browser.back)
         menu.addAction("進む").triggered.connect(self.browser.forward)
         menu.addAction("リロード").triggered.connect(self.browser.reload)
-        
         menu.addSeparator()
-
-        # 【新機能】現在のサイズパターンを保存
+        # --- 【新機能】プリセット切り替えサブメニュー ---
+        preset_menu = menu.addMenu("プリセット切替")
+        config_data = self.config_manager.data
+        presets = config_data.get("presets", [])
+        current_idx = config_data["app_settings"].get("last_active_preset_index", 0)
+        for i, preset in enumerate(presets):
+            name = preset.get("name", f"Preset {i}")
+            # 現在選択中のプリセットにはチェックマークをつける（視認性向上）
+            prefix = "● " if i == current_idx else "   "
+            action = preset_menu.addAction(f"{prefix}{name}")
+            # ラムダの引数に現在の i を固定して渡す
+            action.triggered.connect(lambda checked, idx=i: self.apply_preset(idx))
+        menu.addSeparator()
+        # 設定・保存系
         save_geo_action = menu.addAction("現在のサイズをプリセットに保存")
         save_geo_action.triggered.connect(self.add_current_geometry_to_preset)
-
         menu.addSeparator()
-        
         close_action = menu.addAction("インジケーター化")
-        close_action.triggered.connect(self.close_mini_window)
-        
+        close_action.triggered.connect(self.collapse_to_indicator)
         menu.exec(QCursor.pos())
 
     def add_current_geometry_to_preset(self):
         """現在の状態を『ロックされた新しいパターン』として追加する"""
         data = self.config_manager.data
-        idx = data["app_settings"]["last_active_preset_index"]
-        
+        # 1. 安全にインデックスを取得
+        try:
+            idx = data["app_settings"].get("last_active_preset_index", 0)
+            target_preset = data["presets"][idx]
+        except (IndexError, KeyError):
+            self.show_floating_notify("Error: Preset not found.")
+            return
+        # 2. 現在のウィンドウ情報を取得
         geo = self.geometry()
         new_loc = {
             "x": geo.x(),
@@ -680,55 +929,62 @@ class ResidentWindow(QMainWindow):
             "width": geo.width(),
             "height": geo.height(),
             "opacity": self.windowOpacity(),
-            "is_locked": True # 新しく追加するものは基本「ロック」状態
+            "is_locked": True  # 新しく追加するものは「ロック」状態
         }
-        
-        data["presets"][idx]["locations"].append(new_loc)
+        # 3. locations リストに追加 (append)
+        if "locations" not in target_preset:
+            target_preset["locations"] = []
+        target_preset["locations"].append(new_loc)
+        # 4. 保存と通知
         self.config_manager.save_config()
-        show_floating_notify("★New Size Pattern Locked & Added!")
+        self.show_floating_notify("★New Size Pattern Locked & Added!")
         
     def adjust_zoom(self):
         """現在のウィンドウ幅に基づき、プリセットごとの基準幅(base_width)に合わせてズームを調整"""
+        # 初期化前や設定マネージャーがない場合はスキップ
+        if not hasattr(self, 'config_manager') or self.config_manager is None:
+            return
         new_width = self.width()
+        # 前回の幅と同じなら処理しない（無駄な計算を回避）
         if hasattr(self, '_last_zoom_width') and self._last_zoom_width == new_width:
             return
-        # 1. JSONから現在のプリセットの基準幅を取得
-        data = self.config_manager.data
-        idx = data["app_settings"]["last_active_preset_index"]
-        # 将来的に 'base_width' キーが追加されることを見越して get() を使用
-        preset = data["presets"][idx]
-        base_width = preset.get("base_width", 500)
-        zoom_level = new_width / base_width
-        zoom_level = max(0.4, min(zoom_level, 2.0))
-        self.browser.setZoomFactor(zoom_level)
-        self._last_zoom_width = new_width
-        
-    def resizeEvent(self, event):
-        # 親クラスの標準処理をまず実行
-        super().resizeEvent(event)
-        # サイズ変更に合わせてズームを動的に更新
-        self.adjust_zoom()
+        try:
+            # 1. JSONから現在のプリセット情報を取得
+            data = self.config_manager.data
+            idx = data["app_settings"].get("last_active_preset_index", 0)
+            preset = data["presets"][idx]
+            # 2. 基準幅(base_width)を取得（未設定なら500pxをデフォルトに）
+            base_width = preset.get("base_width", 500)
+            # 3. ズーム倍率を計算
+            zoom_level = new_width / base_width
+            # 極端な数値にならないよう制限（0.4倍〜2.0倍）
+            zoom_level = max(0.4, min(zoom_level, 2.0))
+            # 4. ブラウザに適用
+            self.browser.setZoomFactor(zoom_level)
+            self._last_zoom_width = new_width
+        except (IndexError, KeyError, ZeroDivisionError) as e:
+            # 基準幅が0だった場合などのエラー回避
+            print(f"Zoom adjustment failed: {e}")
         
     def cycle_geometry(self):
         """Alt + D: 現在のプリセット内で locations を巡回する"""
+        # 描画のチラつきを抑える
         self.setUpdatesEnabled(False)
         try:
+            # 1. 切り替える前に現在のURLなどを保存
+            self.save_current_state()
             data = self.config_manager.data
-            idx = data["app_settings"]["last_active_preset_index"]
+            idx = data["app_settings"].get("last_active_preset_index", 0)
             locations = data["presets"][idx].get("locations", [])
-            
             if not locations:
+                self.show_floating_notify("No size patterns found.")
                 return
-
-            # インデックスを次に進める
+            # 2. インデックスを次に進める（ループ処理）
             self.current_location_index = (self.current_location_index + 1) % len(locations)
-            
-            # 新しい位置・サイズを適用
+            # 3. 新しい位置・サイズを適用
             self.apply_config_geometry()
-            
-            # 状態通知
-            show_floating_notify(f"Size Pattern: {self.current_location_index + 1}/{len(locations)}")
-            
+            # 4. 通知を表示
+            self.show_floating_notify(f"Size: {self.current_location_index + 1}/{len(locations)}")
         except Exception as e:
             print(f"Error in cycle_geometry: {e}")
         finally:
@@ -737,115 +993,82 @@ class ResidentWindow(QMainWindow):
 
     def apply_config_geometry(self):
         """現在のインデックスに基づき、JSONから座標・サイズ・不透明度を読み込んで適用する"""
-        data = self.config_manager.data
-        idx = data["app_settings"]["last_active_preset_index"]
-        
         try:
+            data = self.config_manager.data
+            idx = data["app_settings"].get("last_active_preset_index", 0)
             loc = data["presets"][idx]["locations"][self.current_location_index]
-            
             # 座標とサイズの適用
             self.setGeometry(loc["x"], loc["y"], loc["width"], loc["height"])
-            
-            # 不透明度の適用 (キーがなければデフォルト1.0)
+            # 不透明度の適用
             opacity = loc.get("opacity", 1.0)
             self.setWindowOpacity(opacity)
-            
-        except (IndexError, KeyError):
-            print("Failed to apply geometry: Index out of range.")
+        except (IndexError, KeyError) as e:
+            print(f"Failed to apply geometry: {e}")
     
     def save_current_state(self):
+        """現在の状態（URL、およびアンロック時のみ座標）を保存する"""
         if not hasattr(self, 'config_manager') or self.config_manager is None:
             return
-        """現在のウィンドウ位置、サイズ、URLをJSONに保存する"""
         try:
-            # 1. 現在のプリセットを取得
-            idx = self.config_manager.data["app_settings"]["last_active_preset_index"]
-            preset = self.config_manager.data["presets"][idx]
-
-            # 2. 基本情報の更新
-            preset["last_url"] = self.browser.url().toString()
-
-            # 3. 現在の「位置とサイズ」の保存
-            # ※ Alt+Dで切り替えている最中のインデックス（current_location_indexなど）に合わせる
-            loc_idx = getattr(self, 'current_location_index', 0)
-            
-            # リストの範囲内であることを確認して更新
-            if loc_idx < len(preset["locations"]):
-                geo = self.geometry()
-                preset["locations"][loc_idx] = {
-                    "x": geo.x(),
-                    "y": geo.y(),
-                    "width": geo.width(),
-                    "height": geo.height(),
-                    "opacity": self.windowOpacity()
-                }
-            # 4. ファイルへ書き出し
+            data = self.config_manager.data
+            idx = data["app_settings"].get("last_active_preset_index", 0)
+            preset = data["presets"][idx]
+            # 1. URLの保存（これはロックに関係なく最新を保持）
+            current_url = self.browser.url().toString()
+            if current_url and current_url != "about:blank":
+                preset["last_url"] = current_url
+            # 2. 座標情報の保存（アンロック状態の時のみ）
+            self._update_geometry_if_unlocked()
+            # 3. ファイルへ書き出し
             self.config_manager.save_config()
-            
-        # ... 以降の保存処理 ...
         except Exception as e:
             print(f"Save failed: {e}")
-        
-    # Alt+D 実行時のメソッド（例：change_location）を修正
-    def change_location(self):
-        # 切り替える前に現在の状態を保存
-        self.save_current_state()
-
-        # --- 既存の切り替えロジック ---
-        self.current_location_index = (self.current_location_index + 1) % len(self.current_locations)
-        loc = self.current_locations[self.current_location_index]
-        self.setGeometry(loc['x'], loc['y'], loc['width'], loc['height'])
-        self.setWindowOpacity(loc.get('opacity', 1.0))
-        # ----------------------------
-
-        # 切り替え後のインデックス状態も保存
-        self.save_current_state()
-        
-    def moveEvent(self, event):
-        """ウィンドウが移動したときに呼ばれるイベント"""
-        super().moveEvent(event)
-        self._update_geometry_if_unlocked()
-
-    def resizeEvent(self, event):
-        """ウィンドウサイズが変わったときに呼ばれるイベント"""
-        super().resizeEvent(event)
-        self._update_geometry_if_unlocked()
-        
-    def closeEvent(self, event):
-        self.save_current_state()
-        super().closeEvent(event)
-        
+            
     def _update_geometry_if_unlocked(self):
-        """ロックされていなければ、現在の座標・サイズをJSONに即時反映する"""
-        # 準備ができていない場合はスキップ（以前実装したガード節）
+        """現在のスロットがロックされていなければ、メモリ上のデータを更新する"""
         if not hasattr(self, 'config_manager') or self.config_manager is None:
             return
-
         data = self.config_manager.data
-        idx = data["app_settings"]["last_active_preset_index"]
+        idx = data["app_settings"].get("last_active_preset_index", 0)
         loc_idx = getattr(self, 'current_location_index', 0)
-
         try:
             target_location = data["presets"][idx]["locations"][loc_idx]
-            
-            # 【核心】ロックされている場合は、メモリ上のデータもファイルも更新しない
-            if target_location.get("is_locked", True):
+            # ロックされている場合は座標を更新しない
+            if target_location.get("is_locked", False):
                 return
-
-            # アンロック状態なら、現在の状態を保存
+            # アンロック状態なら、現在のウィンドウ座標をメモリに反映
             geo = self.geometry()
             target_location.update({
                 "x": geo.x(),
                 "y": geo.y(),
                 "width": geo.width(),
-                "height": geo.height()
+                "height": geo.height(),
+                "opacity": self.windowOpacity()
             })
-            
-            # 物理ファイルに書き出し
-            self.config_manager.save_config()
-            
+            # ※ save_config は呼び出し元の save_current_state 等で行うためここでは不要
         except (IndexError, KeyError):
             pass
+        
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        # 移動中、メモリ上の座標データのみ更新（ロックされていなければ）
+        self._update_geometry_if_unlocked()
+
+    def resizeEvent(self, event):
+        """ウィンドウサイズが変わったときに呼ばれるイベント（統合版）"""
+        super().resizeEvent(event)
+        # 1. ロックされていなければ、現在のサイズをメモリに反映
+        self._update_geometry_if_unlocked()
+        # 2. ウィンドウ幅に合わせてコンテンツのズームを調整
+        self.adjust_zoom()
+        
+    def closeEvent(self, event):
+        # 終了時にURLと最新座標をまとめてファイル保存
+        self.save_current_state()
+        super().closeEvent(event)
+        
+        
+        
         
     def _handle_audio_status(self, audible):
         """音が止まってもインジケーターは消さず、状態（アイコン）だけ更新する"""
@@ -855,11 +1078,11 @@ class ResidentWindow(QMainWindow):
 
     def _on_title_changed(self, title):
         # hasattr を使うことで、変数が存在しない場合のクラッシュを防ぐ
-        if not hasattr(self, 'audio_indicator') or self.audio_indicator is None:
+        if not hasattr(self, 'collapsed_indicator') or self.collapsed_indicator is None:
             return
         """動画が切り替わるなどしてタイトルが変わった時の処理"""
         # インジケーターが表示されている（格納状態である）時だけ更新をかける
-        if self.audio_indicator and self.audio_indicator.isVisible():
+        if self.collapsed_indicator and self.collapsed_indicator.isVisible():
             self._show_indicator()
 
     def _show_indicator(self):
@@ -889,18 +1112,18 @@ class ResidentWindow(QMainWindow):
         bg_color = styles.get("bg_color", "#2C3E50")
         
         # --- 2. インジケーターの生成・レイアウト構築 (初回のみ) ---
-        if not self.audio_indicator:
+        if not self.collapsed_indicator:
             # ClickableLabel は既存のクラスを使用
-            self.audio_indicator = ClickableLabel("", None)
-            self.audio_indicator.setWindowFlags(
+            self.collapsed_indicator = ClickableLabel("", None)
+            self.collapsed_indicator.setWindowFlags(
                 Qt.WindowType.FramelessWindowHint | 
                 Qt.WindowType.WindowStaysOnTopHint | 
                 Qt.WindowType.Tool
             )
-            self.audio_indicator.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-            self.audio_indicator.clicked.connect(self._handle_indicator_click)
+            self.collapsed_indicator.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.collapsed_indicator.clicked.connect(self._handle_indicator_click)
             
-            layout = QHBoxLayout(self.audio_indicator)
+            layout = QHBoxLayout(self.collapsed_indicator)
             self.icon_label = QLabel()
             self.text_label = QLabel()
             self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -919,7 +1142,7 @@ class ResidentWindow(QMainWindow):
             border: 1px solid {text_color};
             border-radius: {container_radius}px;
         """
-        self.audio_indicator.setStyleSheet(container_style)
+        self.collapsed_indicator.setStyleSheet(container_style)
 
         # ラベルのスタイル（文字色とフォントサイズ）
         label_style = f"""
@@ -933,7 +1156,7 @@ class ResidentWindow(QMainWindow):
         self.text_label.setStyleSheet(label_style)
         
         self.icon_label.setFixedWidth(icon_width)
-        self.audio_indicator.layout().setContentsMargins(
+        self.collapsed_indicator.layout().setContentsMargins(
             int(6 * scale), int(5 * scale), int(15 * scale), int(5 * scale)
         )
 
@@ -958,13 +1181,13 @@ class ResidentWindow(QMainWindow):
         self.text_label.setText(display_title)
 
         # --- 5. 配置と表示 ---
-        self.audio_indicator.adjustSize()
+        self.collapsed_indicator.adjustSize()
         screen_rect = QApplication.primaryScreen().geometry()
-        self.audio_indicator.move(
-            screen_rect.width() - self.audio_indicator.width() - 10, 
+        self.collapsed_indicator.move(
+            screen_rect.width() - self.collapsed_indicator.width() - 10, 
             screen_rect.height() - 80 # タスクバーとの干渉を考慮
         )
-        self.audio_indicator.show()
+        self.collapsed_indicator.show()
 
     def _handle_indicator_click(self, area):
         """インジケーターがクリックされた時の処理"""
@@ -973,7 +1196,7 @@ class ResidentWindow(QMainWindow):
             self.show()
             self.raise_()
             self.activateWindow()
-            self._hide_audio_indicator()
+            self._hide_collapsed_indicator()
         
         elif area == "icon":
             js_toggle = """
@@ -1009,17 +1232,17 @@ class ResidentWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         # インジケーターを消す処理などがあればここに追加
-        if self.audio_indicator:
-            self.audio_indicator.hide()
+        if self.collapsed_indicator:
+            self.collapsed_indicator.hide()
             
     def toggle_indicator_mode(self):
-        if self._is_transitioning: return # 処理中なら無視
-        self._is_transitioning = True
+        if self._is_switching_mode: return # 処理中なら無視
+        self._is_switching_mode = True
         
         try:
             # 既存のトグル処理
-            if self.audio_indicator and self.audio_indicator.isVisible():
-                self.audio_indicator.close()
+            if self.collapsed_indicator and self.collapsed_indicator.isVisible():
+                self.collapsed_indicator.close()
                 # ここも QTimer で少し余裕を持たせる
                 QTimer.singleShot(100, self.show_and_activate)
             else:
@@ -1030,17 +1253,17 @@ class ResidentWindow(QMainWindow):
             QTimer.singleShot(500, self._reset_transition_flag)
 
     def _reset_transition_flag(self):
-        self._is_transitioning = False
+        self._is_switching_mode = False
             
     def force_indicator_mode(self):
         """Alt+W用：既にインジケーターなら何もしない、小窓なら確実にインジケーター化する"""
-        if self._is_transitioning: return
+        if self._is_switching_mode: return
         
         # すでにインジケーターが表示中なら、重複処理を避けるために何もしない
-        if self.audio_indicator and self.audio_indicator.isVisible():
+        if self.collapsed_indicator and self.collapsed_indicator.isVisible():
             return
 
-        self._is_transitioning = True
+        self._is_switching_mode = True
         try:
             # 小窓を隠してインジケーターを表示
             self.hide()
@@ -1049,11 +1272,11 @@ class ResidentWindow(QMainWindow):
             # 0.5秒後にフラグをリセット（連打防止）
             QTimer.singleShot(500, self._reset_transition_flag)
 
-    def _hide_audio_indicator(self):
-        if self.audio_indicator:
-            self.audio_indicator.hide()
+    def _hide_collapsed_indicator(self):
+        if self.collapsed_indicator:
+            self.collapsed_indicator.hide()
 
-    def close_mini_window(self):
+    def collapse_to_indicator(self):
         """小窓を閉じたら、必ずインジケーターとして格納する"""
         self.hide()
         self._show_indicator()
@@ -1100,34 +1323,88 @@ class ResidentWindow(QMainWindow):
         }})();
         """
         self.browser.page().runJavaScript(js_code)
+        
+    def apply_site_settings(self, current_url):
+        # SelectorManager に丸投げ！
+        site_data = self.selector_manager.get_data_for_url(current_url)
+
+        if site_data:
+            css = site_data.get("css", "")
+            js = site_data.get("js", "")
+            # ここでCSSとJSを適用する処理へ...
+        else:
+            print("No specific settings for this domain.")
 
     def _on_load_finished(self, ok):
         """ページ読み込み完了時、およびURL変更時に実行"""
         if ok:
             self._apply_site_customizations()
             QTimer.singleShot(1000, self._apply_site_customizations)
+            
+class FloatingNotification(QWidget):
+    def __init__(self, text, color="#00FF00", duration=2500, parent=None):
+        super().__init__(parent)
+        
+        # 1. ウィンドウ属性の設定
+        # Tool: タスクバーに表示しない / Frameless: 枠なし / StaysOnTop: 最前面 / TransparentForInput: クリック透過
+        self.setWindowFlags(
+            Qt.WindowType.Tool | 
+            Qt.WindowType.FramelessWindowHint | 
+            Qt.WindowType.WindowStaysOnTopHint | 
+            Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowOpacity(0.0)  # 最初は透明
+
+        # 2. UIレイアウト
+        layout = QVBoxLayout(self)
+        self.label = QLabel(text)
+        self.label.setStyleSheet(f"""
+            background-color: rgba(30, 30, 30, 200); 
+            color: {color}; 
+            border: 1px solid {color};
+            border-radius: 10px;
+            padding: 12px 20px;
+            font-weight: bold;
+            font-size: 14px;
+        """)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.label)
+
+        # 3. 表示位置の計算（メイン画面の中央上部）
+        self.adjustSize()
+        screen_geometry = QApplication.primaryScreen().geometry()
+        x = (screen_geometry.width() - self.width()) // 2
+        y = 100  # 画面上部から100pxの位置
+        self.move(x, y)
+
+        # 4. アニメーションの設定
+        self.fade_animation = QPropertyAnimation(self, b"windowOpacity")
+        self.fade_animation.setDuration(400)
+        self.fade_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        # 5. ライフサイクルの開始
+        self.show_notification(duration)
+
+    def show_notification(self, duration):
+        """フェードイン開始"""
+        self.show()
+        self.fade_animation.setStartValue(0.0)
+        self.fade_animation.setEndValue(1.0)
+        self.fade_animation.start()
+
+        # 指定時間後にフェードアウトを開始するタイマー
+        QTimer.singleShot(duration, self._hide_notification)
+
+    def _hide_notification(self):
+        """フェードアウトして削除"""
+        self.fade_animation.setDirection(QPropertyAnimation.Direction.Backward)
+        self.fade_animation.finished.connect(self.deleteLater) # 終わったら自分を消去
+        self.fade_animation.start()
 
 # ==========================================
 # 3. 各種シグナル・ホットキー処理
 # ==========================================
-def load_config():
-    """JSONから設定を読み込む。失敗した場合はデフォルトを返す"""
-    try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception as e:
-        print(f"Config load error: {e}")
-    return DEFAULT_CONFIG.copy()
-
-def save_config(config):
-    """設定をJSONファイルに保存する"""
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        print(f"設定の保存に失敗しました: {e}")
-
 def get_portal_url():
     """アクティブなブラウザからURLを抽出する (自分自身やフォルダは除外)"""
     try:
@@ -1158,162 +1435,83 @@ def get_portal_url():
         return None
     return None
 
-def on_copy_signal():
-    """Alt + C: クリップボードを汚さず、直接JSONのlast_urlを更新する"""
-    url = get_portal_url()
-    if not url:
-        return
-
-    if current_window:
-        data = current_window.config_manager.data
-        idx = data["app_settings"]["last_active_preset_index"]
-        
-        if 0 <= idx < len(data["presets"]):
-            # 直接JSONデータを書き換え
-            data["presets"][idx]["last_url"] = url
-            # 物理ファイルへ即時保存
-            current_window.config_manager.save_config()
-            
-            # クリップボードへの setText は削除（汚さないため）
-            show_floating_notify("★Target URL Saved to JSON!")
-
-def on_paste_signal():
-    """Alt + V: クリップボードを優先し、使用後はクリアする。なければJSONから復元"""
-    if current_window:
-        data = current_window.config_manager.data
-        idx = data["app_settings"]["last_active_preset_index"]
-        preset = data["presets"][idx]
-        
-        # 1. 座標適用
-        current_window.apply_config_geometry()
-        
-        # 2. URL決定
-        clipboard = QApplication.clipboard()
-        clipboard_text = clipboard.text().strip()
-        
-        is_from_clipboard = False
-        if clipboard_text.startswith("http"):
-            target_url = clipboard_text
-            is_from_clipboard = True
-        else:
-            target_url = preset.get("last_url", "https://www.google.com")
-
-        current_window.browser.setUrl(QUrl(target_url))
-        
-        # 3. 使い捨て処理：クリップボードから取得した場合のみクリア
-        if is_from_clipboard:
-            clipboard.clear()
-            show_floating_notify("★URL Loaded & Clipboard Cleared")
-        else:
-            show_floating_notify("★URL Restored from History")
-
-        current_window.show()
-        current_window.raise_()
-        current_window.activateWindow()
-    
-def on_show_signal():
-    """Alt+S：現在のウィンドウをそのまま再表示する"""
-    global current_window
-    if current_window:
-        current_window.show()
-        current_window.raise_()
-        current_window.activateWindow()
-        
-        # もし音声インジケーターが表示されていたら隠す
-        if hasattr(current_window, '_hide_audio_indicator'):
-            current_window._hide_audio_indicator()
-    else:
-        # ウィンドウがまだ一度も作られていない場合は「コピーからしてね」と通知
-        show_floating_notify("No window to show. Press Alt+C first.")
-
-def show_floating_notify(text):
-    global _notif
-    config = load_config()
-    # "indicator_color" を "theme_color" に置換済みの前提
-    theme_color = config.get("theme_color", "#00FF00")
-    
-    _notif = FloatingNotification(text)
-    # 通知ラベルのスタイルをJSONの色に同期
-    _notif.label.setStyleSheet(f"""
-        color: {theme_color}; 
-        font-weight: bold; 
-        font-size: 14px;
-        background: transparent;
-    """)
-    _notif.show()
-
 last_action_time = 0
 def check_hotkeys():
     global last_action_time
     now = time.time()
-    if now - last_action_time < 0.3: return
-    
-    if keyboard.is_pressed('alt'):
-        is_shift = keyboard.is_pressed('shift')
-        
-        # 【新規追加】Alt + W
-        if keyboard.is_pressed('w'):
-            bridge.minimize_requested.emit() # 信号を送る
+    if now - last_action_time < 0.3:
+        return
+    # 1. 設定からショートカットキー設定を読み込む（存在しなければデフォルト値を設定）
+    # main_window (ResidentMiniPlayer) を経由して config_manager にアクセス
+    shortcuts = current_window.config_manager.data["app_settings"].get("shortcuts", {})
+    modifier = shortcuts.get("modifier", "alt")
+    # モディファイアキー（Altなど）が押されていなければ終了
+    if not keyboard.is_pressed(modifier):
+        return
+    is_shift = keyboard.is_pressed('shift')
+    # 2. 機能キーとのマッピング表
+    # キー名 : 発火させるシグナル
+    mapping = {
+        shortcuts.get("hide_completely", "w"): bridge.hide_completely_requested,
+        shortcuts.get("show_toggle", "s"):      bridge.show_requested,
+        shortcuts.get("copy", "c"):             bridge.copy_requested,
+        shortcuts.get("paste", "v"):            bridge.paste_requested,
+        shortcuts.get("cycle_size", "d"):       bridge.cycle_geometry_requested # 名称変更を反映
+    }
+    # 3. マッピングに基づいた判定
+    for key, signal in mapping.items():
+        if keyboard.is_pressed(key):
+            # Shiftが必要なキーとそうでないキーの干渉を防ぐガード
+            if key in ['s', 'd'] and is_shift:
+                continue
+            signal.emit()
             last_action_time = now
-        # Alt + S (トグル切り替え)
-        elif keyboard.is_pressed('s') and not is_shift:
-            bridge.show_requested.emit() # 信号を送る
+            return # 1つのキーが判定されたら終了
+    # 4. 数字キー 1~9 の動的スキャン（プリセット切り替え）
+    for i in range(1, 10):
+        if keyboard.is_pressed(str(i)):
+            # Bridgeに新設した preset_switch_requested を使用 (0始まりにするため i-1)
+            bridge.preset_switch_requested.emit(i - 1)
             last_action_time = now
-        elif keyboard.is_pressed('c'):
-            bridge.copy_requested.emit()
-            last_action_time = now
-        elif keyboard.is_pressed('v'):
-            bridge.paste_requested.emit()
-            last_action_time = now
-        elif keyboard.is_pressed('d') and not is_shift:
-            bridge.preset_requested.emit()
-            last_action_time = now
+            return
 
 def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-
     # 1. ConfigManagerのインスタンス化
     config_manager = ConfigManager("config.json") 
-    
     # 2. 【ここを修正】 self.data にアクセスする
     config_dict = config_manager.data 
-
     # 3. 階層を辿って URL を取得
     # config.json の app_settings -> selectors_url を参照
     app_settings = config_dict.get("app_settings", {})
     remote_url = app_settings.get("selectors_url")
-
     # 4. SelectorManager の初期化
     selector_manager = SelectorManager(
         local_path="selectors.json", 
         remote_url=remote_url
     )
-
     # --- 2. Windowを作成 ---
     # インスタンス化したマネージャーたちを渡す
-    main_window = ResidentWindow(config_manager, selector_manager)
-    
+    main_window = ResidentMiniPlayer(config_manager, selector_manager)
     global current_window
     current_window = main_window
-
     # --- 3. シグナルの配線 ---
-    bridge.copy_requested.connect(on_copy_signal)
-    bridge.paste_requested.connect(on_paste_signal)
-    bridge.preset_requested.connect(main_window.cycle_geometry)
-    bridge.show_requested.connect(main_window.toggle_indicator_mode)
-    bridge.minimize_requested.connect(main_window.force_indicator_mode)
-
+    bridge.copy_requested.connect(main_window.capture_current_url)
+    bridge.paste_requested.connect(main_window.apply_url_from_dispatch)
+    bridge.cycle_geometry_requested.connect(main_window.cycle_geometry)
+    bridge.preset_switch_requested.connect(main_window.apply_preset)
+    bridge.show_requested.connect(main_window.handle_show_request)
+    bridge.hide_completely_requested.connect(
+        lambda: main_window.update_display_mode(DisplayMode.HIDDEN)
+    )
     # --- 4. システム・監視系 ---
     signal.signal(signal.SIGINT, signal.SIG_DFL)
-    
     monitor_timer = QTimer()
     monitor_timer.setParent(main_window) 
     monitor_timer.timeout.connect(check_hotkeys)
     monitor_timer.start(50)
-
     print("Watching Alt+C/V/D/S... (Press Ctrl+C to stop)")
-    
     main_window.show()
     sys.exit(app.exec())
 

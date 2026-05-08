@@ -234,72 +234,52 @@ class ResidentWindow(QMainWindow):
         self.page.loadFinished.connect(self._install_proxy_filter)
         
     def inject_adblock(self):
-        # ログが出ることは確認済みなので、中身を「最も単純な背景色変更」でテストします
-        print(f"DEBUG: Attempting JS Execution on {self.browser.url().toString()}")
+        current_url = self.browser.url().host()
+        
+        try:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            json_path = os.path.join(base_path, "selectors.json")
+            with open(json_path, "r", encoding="utf-8") as f:
+                all_selectors = json.load(f)
+        except Exception as e:
+            print(f"Error loading selectors.json: {e}")
+            return
 
-        js_code = """
+        site_config = all_selectors.get("youtube.com")
+        if not site_config: return
+
+        js_template = """
         (function() {
-            console.log("RESIDENT_JS: Executing...");
-            
-            // テスト1: 画面を真っ赤にする（これが動けば、JSはDOMに触れています）
-            // document.body.style.backgroundColor = 'red'; 
+            const run = () => {
+                // A. 要素を非表示にする
+                const targets = __REMOVE_LIST__;
+                targets.forEach(s => {
+                    const el = document.querySelector(s);
+                    if (el) el.style.display = 'none';
+                });
 
-            // 本番ロジック: CSS Injection
-            const styleId = 'resident-shield';
-            if (!document.getElementById(styleId)) {
-                const style = document.createElement('style');
-                style.id = styleId;
-                style.textContent = `
-                    /* 1. 広告・チャット・サイドバーの完全封印 */
-                    #chat, #chat-container, ytd-live-chat-frame, ytd-live-chat-renderer,
-                    #secondary, .ad-container, .ytd-ad-slot-renderer, #masthead-ad,
-                    ytd-companion-slot-renderer, #player-ads { 
-                        display: none !important; 
-                    }
+                // B. スタイルを適用
+                const styleId = 'resident-shield-v3';
+                let styleTag = document.getElementById(styleId);
+                if (!styleTag) {
+                    styleTag = document.createElement('style');
+                    styleTag.id = styleId;
+                    (document.head || document.documentElement).appendChild(styleTag);
+                }
+                styleTag.textContent = "__CSS_CONTENT__";
+            };
 
-                    /* 2. 黒いマージンの正体「columns」の余白を強制排除 */
-                    #columns.ytd-watch-flexy {
-                        margin: 0 !important;
-                        padding: 0 !important;
-                        width: 100% !important;
-                        max-width: 100% !important;
-                        display: flex !important;
-                        justify-content: center !important;
-                    }
-
-                    /* 3. 動画表示エリアの幅を100%に広げる */
-                    #primary.ytd-watch-flexy {
-                        max-width: 100% !important;
-                        min-width: 100% !important;
-                        margin: 0 !important;
-                        padding: 0 !important;
-                    }
-
-                    /* 4. シアターモード時の内部計算を上書き */
-                    ytd-watch-flexy[theater] #primary-inner.ytd-watch-flexy {
-                        margin-right: 0 !important;
-                    }
-                    
-                    /* 5. プレイヤー背後の黒帯を画面端まで広げる */
-                    #player-container-outer.ytd-watch-flexy, 
-                    #player-container-inner.ytd-watch-flexy {
-                        max-width: 100% !important;
-                        margin: 0 !important;
-                    }
-                `;
-                (document.head || document.documentElement).appendChild(style);
-            }
-
-            // シアターモード
-            const btn = document.querySelector('.ytp-size-button');
-            const player = document.querySelector('#movie_player');
-            if (btn && player && !player.classList.contains('ytp-big-mode')) {
-                btn.click();
-            }
+            run();
+            // YouTubeの動的な再描画に合わせて数回実行
+            setTimeout(run, 1000);
+            setTimeout(run, 3000);
         })();
         """
-        # 世界（コンテキスト）を指定せずに実行
-        self.browser.page().runJavaScript(js_code)
+
+        final_js = js_template.replace("__REMOVE_LIST__", json.dumps(site_config.get("remove", [])))
+        final_js = final_js.replace("__CSS_CONTENT__", site_config.get("css", ""))
+
+        self.browser.page().runJavaScript(final_js)
 
     def _install_proxy_filter(self):
         if self.browser.focusProxy():

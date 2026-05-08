@@ -1,0 +1,12 @@
+{
+  "youtube.com": {
+    "remove": [
+      "#chat", "#chat-container", "ytd-live-chat-frame", 
+      "ytd-live-chat-renderer", ".ad-container", 
+      ".ytd-ad-slot-renderer", "#masthead-ad",
+      "ytd-companion-slot-renderer", "#player-ads"
+    ],
+    "css": "html, body { overflow-x: hidden !important; width: 100% !important; margin: 0 !important; } #secondary { display: none !important; } #primary { width: 100% !important; max-width: 100% !important; margin: 0 !important; padding: 0 !important; } #columns { display: block !important; } #player-container { width: 100% !important; max-width: 100% !important; margin: 0 !important; } #movie_player { left: 0 !important; }",
+    "theater_btn": ".ytp-size-button"
+  }
+}

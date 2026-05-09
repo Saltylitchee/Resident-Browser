@@ -59,6 +59,7 @@ class ConfigManager:
     DEFAULT_CONFIG = {
         "app_settings": {
             "auto_start": False,
+            "show_notifications": True,
             "last_active_preset_index": 0,
             "global_indicator_scale": 1.0,
             "selectors_url": None,  # セレクタ管理との連携用
@@ -189,36 +190,87 @@ class SelectorManager:
         """URLからドメインを抽出し、正確にマッチングさせる"""
         if not self.selectors:
             return None
-        
         # URLから純粋なホスト名（例: www.youtube.com）を取得
         try:
             parsed_url = urlparse(url)
             hostname = parsed_url.netloc
         except:
             return None
-
         # ドメインの部分一致判定を少し厳格にする
         for domain_key, data in self.selectors.items():
             if domain_key in hostname:
                 return data
         return None
     
+    
+    
 class FloatingNotification(QWidget):
-    def __init__(self, text):
-        super().__init__()
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+    def __init__(self, text, color="#00FF7F", bg_color="#2C3E50", duration=2000):
+        super().__init__(None)
+        self.bg_color = bg_color
+        # 1. 基本属性：最前面表示、枠なし、クリック透過、タスクバー非表示
+        self.setWindowFlags(
+            Qt.WindowType.Tool | 
+            Qt.WindowType.FramelessWindowHint | 
+            Qt.WindowType.WindowStaysOnTopHint | 
+            Qt.WindowType.WindowTransparentForInput
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        
+        # 2. UIデザイン：モダンな半透明ブラック
         layout = QVBoxLayout(self)
         self.label = QLabel(text)
-        self.label.setStyleSheet("background-color: rgba(0, 0, 0, 180); color: #00ff7f; font-weight: bold; padding: 8px 15px; border-radius: 5px;")
-        self.label.setFont(QFont("Arial", 12))
+        self.label.setStyleSheet(f"""
+            background-color: rgba(20, 20, 20, 220); 
+            color: {color}; 
+            border: 1px solid {color};
+            border-radius: 8px;
+            padding: 10px 20px;
+            font-weight: bold;
+            font-size: 13px;
+            font-family: 'Segoe UI', Arial;
+        """)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.label)
+        # 3. 位置設定：画面の中央上部へ配置
+        self.adjustSize()
+        screen = QApplication.primaryScreen().geometry()
+        self.move((screen.width() - self.width()) // 2, 80)
+        # 4. アニメーション：フェードイン・アウト
+        self.setWindowOpacity(0.0)
+        self.animation = QPropertyAnimation(self, b"windowOpacity")
+        self.animation.setDuration(300)
+        self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        # 5. 実行シーケンス
+        self.start_show(duration)
         
-        pos = QCursor.pos()
-        self.move(pos.x() + 20, pos.y() - 20)
-        QTimer.singleShot(1500, self.close)
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # configから渡された背景色を使用
+        bg = QColor(self.bg_color)
+        bg.setAlpha(230) 
+        painter.setBrush(bg)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(self.rect(), 10, 10)
+
+    def start_show(self, duration):
+        """フェードイン -> 待機 -> フェードアウト の流れ"""
+        self.show()
+        # フェードイン
+        self.animation.setStartValue(0.0)
+        self.animation.setEndValue(1.0)
+        self.animation.start()
+        # 指定時間後にフェードアウトを開始
+        QTimer.singleShot(duration, self.start_fade_out)
+
+    def start_fade_out(self):
+        """フェードアウトして閉じる"""
+        self.animation.setDirection(QPropertyAnimation.Direction.Backward)
+        self.animation.finished.connect(self.close)
+        self.animation.start()
+
+
 
 class ClickableLabel(QLabel):
     clicked = pyqtSignal(str)
@@ -226,41 +278,52 @@ class ClickableLabel(QLabel):
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._current_color = "#00FF00" # デフォルト
+        # デフォルト値
+        self._text_color = "#00FF00"
+        self._bg_color = "#2C3E50"
+        self._shape = "rounded_rect"
+
+    def set_custom_style(self, text_color, bg_color, shape):
+        """外部からスタイルを更新するためのメソッド"""
+        self._text_color = text_color
+        self._bg_color = bg_color
+        self._shape = shape
+        self.update()  # 再描画を強制
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # 背景色と枠線の色
-        bg_color = QColor(60, 60, 60, 230)
-        border_color = QColor(self._current_color)
+        # 設定から色を取得
+        bg_color = QColor(self._bg_color)
+        bg_color.setAlpha(230) # 透明度を維持
+        border_color = QColor(self._text_color)
 
-        # 1. 描画エリアの確定（少し内側にマージンを取る）
         rect = self.rect().adjusted(1, 1, -1, -1)
 
-        # 2. 背景の描画
+        # 背景と枠線の描画
         painter.setBrush(QBrush(bg_color))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(rect, 15, 15)
-
-        # 3. 枠線の描画
         pen = QPen(border_color)
         pen.setWidth(2)
         painter.setPen(pen)
-        painter.drawRoundedRect(rect, 15, 15)
+
+        # 形状（Shape）の判定ロジック
+        if self._shape == "circle":
+            painter.drawEllipse(rect)
+        elif self._shape == "rect":
+            painter.drawRect(rect)
+        else:  # デフォルトは rounded_rect
+            painter.drawRoundedRect(rect, 15, 15)
         
         painter.end()
-
-        # 4. 文字だけを上に描画させる（背景を描画させないために重要）
-        # super().paintEvent(event) を呼ぶ前に背景を自前で塗りつぶしているので
-        # ラベルのデフォルト描画が干渉しないよう制御します
         super().paintEvent(event)
-
+        
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            # アイコン付近かタイトル付近かの判定
-            if event.pos().x() < 45:
+            # 判定基準を固定の45ではなく、現在の幅の割合にするか、
+            # あるいは親から icon_width をもらって判定するのがスマートです
+            icon_area_width = self.layout().contentsMargins().left() + 30 # 大よその目安
+            if event.pos().x() < icon_area_width:
                 self.clicked.emit("icon")
             else:
                 self.clicked.emit("title")
@@ -301,9 +364,15 @@ class ResidentMiniPlayer(QMainWindow):
                 self._set_desktop_cookie_directly()
                 self.browser.setZoomFactor(0.8)
                 self.profile.setHttpUserAgent(self.ua_desktop)
-            
             if preset.get("last_url"):
-                self.browser.setUrl(QUrl(str(preset["last_url"])))
+                url_str = str(preset["last_url"])
+                # URLに字幕オフのパラメータを追加
+                # cc_load_policy=0: 字幕をデフォルトで非表示にする
+                if "?" in url_str:
+                    url_str += "&cc_load_policy=0"
+                else:
+                    url_str += "?cc_load_policy=0"
+                self.browser.setUrl(QUrl(url_str))
         # 直接呼び出すのではなく、タイマーで一瞬だけ遅らせる
         # これにより、Geometry（サイズ）が確実にOS側で適用された後にリクエストが飛ぶ
         QTimer.singleShot(50, start_initial_load)
@@ -410,21 +479,26 @@ class ResidentMiniPlayer(QMainWindow):
         self.update_display_mode(DisplayMode.EXPANDED) # 貼り付けたら即・小窓へ
         
     def show_floating_notify(self, text):
-        """
-        現在のプリセット色を取得して通知を表示する。
-        以前のグローバル関数を置き換える。
-        """
-        # 1. 現在のプリセットからテーマ色を取得
+        """通知の表示（プリセットごとの背景色を適用）"""
+        # 1. 通知のオンオフ設定を確認
+        show_notif = self.config_manager.data["app_settings"].get("show_notifications", True)
+        if not show_notif:
+            return
+        # 2. 現在のプリセットから背景色と文字色を取得
         try:
             data = self.config_manager.data
             idx = data["app_settings"].get("last_active_preset_index", 0)
-            color = data["presets"][idx]["indicator_styles"].get("text_color", "#00FF00")
+            styles = data["presets"][idx].get("indicator_styles", {})
+            # 通知の文字色（基本はインジケーターの文字色と同じ）
+            text_color = styles.get("text_color", "#00FF7F")
+            # 通知の背景色（設定がなければデフォルトの濃いグレー）
+            bg_color = styles.get("notif_bg_color", "#2C3E50") 
         except (KeyError, IndexError):
-            color = "#00FF00"
-
-        # 2. 通知インスタンスの生成 (参照を保持しなくても deleteLater で消える)
-        self._last_notification = FloatingNotification(text, color=color)
-        
+            text_color = "#00FF7F"
+            bg_color = "#2C3E50"
+        # 3. FloatingNotification側に背景色を渡す
+        # （FloatingNotification側の__init__が背景色を受け取れるよう修正が必要です）
+        self._last_notification = FloatingNotification(text, color=text_color, bg_color=bg_color)
         
         
         
@@ -674,15 +748,24 @@ class ResidentMiniPlayer(QMainWindow):
             var m_web = document.getElementsByTagName('ytm-app')[0];
             if (m_web) { m_web.style.display = 'none'; }
 
-            // 2. Cookieの再セット
-            document.cookie = "PREF=f6=40000; domain=.youtube.com; path=/";
+            // 2. Cookieの再セット（デスクトップ設定の維持）
+            try {
+                document.cookie = "PREF=f6=40000; domain=.youtube.com; path=/";
+            } catch (e) {
+                console.warn("Cookie injection blocked by browser security.");
+            }
             
             // 3. YouTubeの内部フラグ書き換え
             if (window.yt && window.yt.config_) {
                 window.yt.config_.EXPERIMENT_FLAGS.kevlar_is_mweb_modern_f_and_e_interaction = false;
             }
             
-            // 4. ViewportをPCサイズで固定（再定義）
+            var target = document.getElementsByTagName('head')[0] || document.documentElement;
+            if (target) {
+                target.appendChild(newMeta);
+            }
+            
+            // 4. ViewportをPCサイズで固定
             var meta = document.querySelector('meta[name="viewport"]');
             if (meta) { 
                 meta.setAttribute('content', 'width=1280, initial-scale=1.0');
@@ -693,7 +776,22 @@ class ResidentMiniPlayer(QMainWindow):
                 document.getElementsByTagName('head')[0].appendChild(newMeta);
             }
 
-            // 5. YouTubeに「画面が変わったぞ」と叫ぶ
+            // 5. 字幕（CC）を強制オフにするロジック
+            var disableSubtitles = function() {
+                // YouTubeプレーヤーの字幕ボタンを取得
+                var ccButton = document.querySelector('.ytp-subtitles-button');
+                // ボタンが存在し、かつ「押されている（オン）」状態ならクリックしてオフにする
+                if (ccButton && ccButton.getAttribute('aria-pressed') === 'true') {
+                    ccButton.click();
+                    console.log("Subtitles disabled by ResidentBrowser");
+                }
+            };
+
+            // 即時実行と、要素のレンダリング待ちを考慮した遅延実行（1秒後）
+            disableSubtitles();
+            setTimeout(disableSubtitles, 1000);
+
+            // 6. YouTubeに「画面サイズが変わったぞ」と叫ぶ
             window.dispatchEvent(new Event('resize'));
         })();
         """
@@ -1139,6 +1237,16 @@ class ResidentMiniPlayer(QMainWindow):
         self.save_current_state()
         super().closeEvent(event)
         
+    def show_floating_notification(self, text):
+        # 1. 全体設定で通知がオフなら何もしない
+        if not self.config_manager.data["app_settings"].get("show_notifications", True):
+            return
+        # 2. 現在のプリセットから通知色を取得
+        preset = self.config_manager.data["presets"][self._current_preset_idx]
+        n_color = preset.get("indicator_styles", {}).get("notification_color", "#00FF7F")
+        # 3. 通知を表示
+        self.notif = FloatingNotification(text, color=n_color)
+        
         
         
         
@@ -1171,21 +1279,21 @@ class ResidentMiniPlayer(QMainWindow):
         self.browser.page().runJavaScript(js_code, self._update_indicator_with_state)
 
     def _update_indicator_with_state(self, state):
-        """ConfigManagerから最新のスタイル（色・背景・スケール）を読み込んで表示"""
-        # --- 1. データの取得 ---
         data = self.config_manager.data
         idx = data["app_settings"]["last_active_preset_index"]
         preset = data["presets"][idx]
         styles = preset.get("indicator_styles", {})
         scale = data["app_settings"].get("global_indicator_scale", 1.0)
 
-        # 設定値の抽出
+        # 1. 必要な計算
+        scaled_font_size = int(10 * scale)
+        icon_width = int(30 * scale)
         text_color = styles.get("text_color", "#00FF00")
         bg_color = styles.get("bg_color", "#2C3E50")
-        
-        # --- 2. インジケーターの生成・レイアウト構築 (初回のみ) ---
+        shape = styles.get("shape", "rounded_rect")
+
+        # 2. インジケーターの生成
         if not self.collapsed_indicator:
-            # ClickableLabel は既存のクラスを使用
             self.collapsed_indicator = ClickableLabel("", None)
             self.collapsed_indicator.setWindowFlags(
                 Qt.WindowType.FramelessWindowHint | 
@@ -1193,46 +1301,29 @@ class ResidentMiniPlayer(QMainWindow):
                 Qt.WindowType.Tool
             )
             self.collapsed_indicator.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-            self.collapsed_indicator.clicked.connect(self._handle_indicator_click)
             
+            # レイアウト作成
             layout = QHBoxLayout(self.collapsed_indicator)
-            self.icon_label = QLabel()
+            # 余白を設定して背景の枠と文字が重ならないようにする
+            layout.setContentsMargins(int(10*scale), int(5*scale), int(15*scale), int(5*scale))
+            layout.setSpacing(int(5*scale))
+            
+            self.icon_label = QLabel() 
             self.text_label = QLabel()
             self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             
             layout.addWidget(self.icon_label)
             layout.addWidget(self.text_label)
+            self.collapsed_indicator.clicked.connect(self._handle_indicator_click)
 
-        # --- 3. スタイルの適用 (スケール対応) ---
-        scaled_font_size = int(10 * scale)
-        container_radius = int(5 * scale)
-        icon_width = int(30 * scale)
-        
-        # コンテナ全体のスタイル（背景色と枠線）
-        container_style = f"""
-            background-color: {bg_color};
-            border: 1px solid {text_color};
-            border-radius: {container_radius}px;
-        """
-        self.collapsed_indicator.setStyleSheet(container_style)
-
-        # ラベルのスタイル（文字色とフォントサイズ）
-        label_style = f"""
-            color: {text_color};
-            font-weight: bold;
-            font-size: {scaled_font_size}pt;
-            background: transparent;
-            border: none;
-        """
+        # 3. スタイルの更新
+        self.collapsed_indicator.set_custom_style(text_color, bg_color, shape)
+        label_style = f"color: {text_color}; font-weight: bold; font-size: {scaled_font_size}pt; background: transparent; border: none;"
         self.icon_label.setStyleSheet(label_style)
         self.text_label.setStyleSheet(label_style)
-        
         self.icon_label.setFixedWidth(icon_width)
-        self.collapsed_indicator.layout().setContentsMargins(
-            int(6 * scale), int(5 * scale), int(15 * scale), int(5 * scale)
-        )
 
-        # --- 4. 状態に応じたコンテンツの更新 ---
+        # 4. 【重要】コンテンツの代入（ここが抜けていました）
         # アイコンの決定
         if state == 'playing':
             icon = "♪"
@@ -1242,23 +1333,25 @@ class ResidentMiniPlayer(QMainWindow):
             icon = "❏"
         self.icon_label.setText(icon)
 
-        # タイトルの整形
+        # タイトルの整形（(1) YouTube 等の通知数字を消す）
         raw_title = self.browser.title()
         clean_title = re.sub(r'^\(\d+\)\s*', '', raw_title)
         if not clean_title or clean_title == "about:blank": 
             clean_title = "Resident Browser"
-
-        max_length = 30
+        
+        # 長すぎるタイトルをカット
+        max_length = 25
         display_title = (clean_title[:max_length] + "...") if len(clean_title) > max_length else clean_title
         self.text_label.setText(display_title)
 
-        # --- 5. 配置と表示 ---
+        # 5. サイズ確定と配置
+        # 先に文字を入れてから adjustSize を呼ぶことで中身に合わせたサイズになる
         self.collapsed_indicator.adjustSize()
-        screen_rect = QApplication.primaryScreen().geometry()
-        self.collapsed_indicator.move(
-            screen_rect.width() - self.collapsed_indicator.width() - 10, 
-            screen_rect.height() - 80 # タスクバーとの干渉を考慮
-        )
+        
+        screen = QApplication.primaryScreen().availableGeometry()
+        x = screen.right() - self.collapsed_indicator.width() - 10
+        y = screen.bottom() - self.collapsed_indicator.height() - 10
+        self.collapsed_indicator.move(x, y)
         self.collapsed_indicator.show()
 
     def _handle_indicator_click(self, area):
@@ -1421,51 +1514,6 @@ class ResidentMiniPlayer(QMainWindow):
             QTimer.singleShot(1000, self._apply_site_customizations)
             if self.width() > 800:
                 QTimer.singleShot(1500, self._force_desktop_layout)
-            
-class FloatingNotification(QWidget):
-    def __init__(self, text, color="#00FF00", duration=2500, parent=None):
-        super().__init__(parent)
-        
-        # 1. ウィンドウ属性の設定
-        # Tool: タスクバーに表示しない / Frameless: 枠なし / StaysOnTop: 最前面 / TransparentForInput: クリック透過
-        self.setWindowFlags(
-            Qt.WindowType.Tool | 
-            Qt.WindowType.FramelessWindowHint | 
-            Qt.WindowType.WindowStaysOnTopHint | 
-            Qt.WindowType.WindowTransparentForInput
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowOpacity(0.0)  # 最初は透明
-
-        # 2. UIレイアウト
-        layout = QVBoxLayout(self)
-        self.label = QLabel(text)
-        self.label.setStyleSheet(f"""
-            background-color: rgba(30, 30, 30, 200); 
-            color: {color}; 
-            border: 1px solid {color};
-            border-radius: 10px;
-            padding: 12px 20px;
-            font-weight: bold;
-            font-size: 14px;
-        """)
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.label)
-
-        # 3. 表示位置の計算（メイン画面の中央上部）
-        self.adjustSize()
-        screen_geometry = QApplication.primaryScreen().geometry()
-        x = (screen_geometry.width() - self.width()) // 2
-        y = 100  # 画面上部から100pxの位置
-        self.move(x, y)
-
-        # 4. アニメーションの設定
-        self.fade_animation = QPropertyAnimation(self, b"windowOpacity")
-        self.fade_animation.setDuration(400)
-        self.fade_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-        # 5. ライフサイクルの開始
-        self.show_notification(duration)
 
     def show_notification(self, duration):
         """フェードイン開始"""

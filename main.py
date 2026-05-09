@@ -348,7 +348,7 @@ class ResidentMiniPlayer(QMainWindow):
         self._current_preset_idx = config_data["app_settings"].get("last_active_preset_index", 0)
         self.current_location_index = config_data["presets"][self._current_preset_idx].get("last_location_index", 0)
         # --- 2. UIとブラウザのセットアップ ---
-        self.setWindowTitle("Resident Browser")
+        self.setWindowTitle("Doppel")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self._setup_browser()
         self._setup_ui()
@@ -1365,7 +1365,7 @@ class ResidentMiniPlayer(QMainWindow):
         raw_title = self.browser.title()
         clean_title = re.sub(r'^\(\d+\)\s*', '', raw_title)
         if not clean_title or clean_title == "about:blank": 
-            clean_title = "Resident Browser"
+            clean_title = "Doppel"
         
         max_length = 25
         display_title = (clean_title[:max_length] + "...") if len(clean_title) > max_length else clean_title
@@ -1582,12 +1582,10 @@ def get_portal_url():
     """アクティブなブラウザからURLを抽出する (自分自身やフォルダは除外)"""
     try:
         from pywinauto import Desktop
-        # 1. ターゲットとなるブラウザのタイトル候補 (必要に応じて追加)
-        # 自身のタイトル "Resident Window" を含むものは明示的に除外
         target_windows = [
             w for w in Desktop(backend="uia").windows(visible_only=True) 
             if ("Chrome" in w.window_text() or "Edge" in w.window_text() or "Firefox" in w.window_text() or "Brave" in w.window_text())
-            and "Resident Window" not in w.window_text() 
+            and "Doppel" not in w.window_text() 
             and w.class_name() != "CabinetWClass"
         ]
         

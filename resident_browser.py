@@ -11,14 +11,15 @@ import requests
 from datetime import datetime
 from urllib.parse import urlparse
 from enum import Enum, auto
+from PyQt6.QtNetwork import QNetworkCookie
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QStatusBar, QMainWindow, QLabel
 )
 from PyQt6.QtCore import (
-    Qt, QUrl, QEvent, QTimer, QObject, pyqtSignal, QPropertyAnimation, QEasingCurve, QPoint
+    Qt, QUrl, QEvent, QTimer, QObject, pyqtSignal, QPropertyAnimation, QEasingCurve, QByteArray
 )
-from PyQt6.QtGui import QCursor, QFont, QPainter, QBrush, QColor, QPen, QShortcut, QKeySequence, QScreen
+from PyQt6.QtGui import QCursor, QFont, QPainter, QBrush, QColor, QPen, QShortcut, QKeySequence
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
 
@@ -94,6 +95,7 @@ class ConfigManager:
         self.config_path = config_path
         # 初期化時に読み込みと整合性チェックを完結させる
         self.data = self.load_config()
+        print(f"DEBUG: Config saved to >>> {os.path.abspath(self.config_path)}")
 
     # --- 2. 読み込みロジックの改善 ---
     def load_config(self):
@@ -112,6 +114,21 @@ class ConfigManager:
             print(f"[Config] Corruption detected: {e}")
             self._backup_corrupted_config()
             return self.save_default_config()
+        
+    def save_config(self):
+        try:
+            # 保存前にディレクトリチェック（Windows環境での安定性のため）
+            os.makedirs(os.path.dirname(os.path.abspath(self.config_path)), exist_ok=True)
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"[Config] Save failed: {e}")
+        print(f"DEBUG: Config saved to >>> {os.path.abspath(self.config_path)}")
+
+    def save_default_config(self):
+        self.data = self.DEFAULT_CONFIG.copy()
+        self.save_config()
+        return self.data
 
     def _deep_merge(self, base, update):
         """再帰的に辞書をマージし、古い設定ファイルに新機能のキーを補完する"""
@@ -130,20 +147,6 @@ class ConfigManager:
             backup_path = f"{self.config_path}_{timestamp}.bak"
             shutil.copy(self.config_path, backup_path)
             print(f"[Config] Backup saved to: {backup_path}")
-
-    def save_config(self):
-        try:
-            # 保存前にディレクトリチェック（Windows環境での安定性のため）
-            os.makedirs(os.path.dirname(os.path.abspath(self.config_path)), exist_ok=True)
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, indent=4, ensure_ascii=False)
-        except Exception as e:
-            print(f"[Config] Save failed: {e}")
-
-    def save_default_config(self):
-        self.data = self.DEFAULT_CONFIG.copy()
-        self.save_config()
-        return self.data
         
 class SelectorManager:
     def __init__(self, local_path="selectors.json", remote_url=None):
@@ -265,41 +268,49 @@ class ClickableLabel(QLabel):
 class ResidentMiniPlayer(QMainWindow):
     def __init__(self, config_manager, selector_manager):
         super().__init__()
+        # --- 1. すべてのインスタンス変数を「最初」に初期化する ---
         self.config_manager = config_manager
-        self.selector_manager = selector_manager # ここで保持する
+        self.selector_manager = selector_manager
         self.current_mode = DisplayMode.EXPANDED
-        self.current_location_index = 0
-        config_data = self.config_manager.data
-        # --- 1. まず変数の定義をすべて済ませる ---
+        self._is_switching_mode = False  # ここに移動！
         self.collapsed_indicator = None
-        # JSON構造に合わせて取得先を変更（app_settingsから取得）
+        self.all_selectors = {}
+        self.current_location_index = 0
+        # データの準備
+        config_data = self.config_manager.data
         self._current_preset_idx = config_data["app_settings"].get("last_active_preset_index", 0)
-        # --- 2. UIのセットアップ ---
+        self.current_location_index = config_data["presets"][self._current_preset_idx].get("last_location_index", 0)
+        # --- 2. UIとブラウザのセットアップ ---
         self.setWindowTitle("Resident Browser")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self._setup_browser()
         self._setup_ui()
-        # --- 3. シグナルの接続 ---
+        # --- 3. ジオメトリの適用 ---
+        self.apply_config_geometry() 
+        # --- 4. シグナルの接続 ---
         self.browser.page().recentlyAudibleChanged.connect(self._handle_audio_status)
         self.browser.titleChanged.connect(self._on_title_changed)
-        # loadFinished だけでなく、URL変更時にもJSを注入する
         self.browser.loadFinished.connect(self.inject_adblock)
         self.browser.urlChanged.connect(lambda: self.inject_adblock()) 
         self.browser.loadFinished.connect(self.adjust_zoom)
-        # --- 4. データのロードと表示 ---
-        # プリセット情報を取得
-        preset = config_data["presets"][self._current_preset_idx]
-        # ジオメトリ（位置・サイズ）の適用
-        # locations[0] を初期位置とするなどの処理に書き換えが必要かもしれません
-        self.apply_config_geometry() 
-        if preset.get("last_url"):
-            self.browser.setUrl(QUrl(str(preset["last_url"])))
-        self._is_switching_mode = False
-        self.all_selectors = {}
-        self.load_selectors() # 起動時に一度読み込む
+        self.browser.loadFinished.connect(self._on_load_finished)
+        # --- 5. URLのロード ---
+        def start_initial_load():
+            preset = config_data["presets"][self._current_preset_idx]
+            if self.width() > 800:
+                self._set_desktop_cookie_directly()
+                self.browser.setZoomFactor(0.8)
+                self.profile.setHttpUserAgent(self.ua_desktop)
+            
+            if preset.get("last_url"):
+                self.browser.setUrl(QUrl(str(preset["last_url"])))
+        # 直接呼び出すのではなく、タイマーで一瞬だけ遅らせる
+        # これにより、Geometry（サイズ）が確実にOS側で適用された後にリクエストが飛ぶ
+        QTimer.singleShot(50, start_initial_load)
+        # セレクターのロード
+        self.load_selectors()
         self.reload_shortcut = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
         self.reload_shortcut.activated.connect(self.reload_and_apply)
-        self.browser.loadFinished.connect(self._on_load_finished)
         
     def handle_show_request(self):
         """
@@ -350,7 +361,17 @@ class ResidentMiniPlayer(QMainWindow):
         url = self.browser.url().toString()
         # 空、about:blank、または初期状態でないことを確認
         return bool(url) and url != "about:blank" and url != ""
-            
+    
+    def _set_desktop_cookie_directly(self):
+        """サーバーへの最初のリクエストに間に合うようにクッキーをセットする"""
+        # QByteArray を使う場合も、文字列をそのまま入れる形式に変更します
+        cookie = QNetworkCookie(QByteArray(b"PREF"), QByteArray(b"f6=40000"))
+        # ここを bytes(b".youtube.com") ではなく str(".youtube.com") に修正
+        cookie.setDomain(".youtube.com")
+        cookie.setPath("/")
+        # クッキーをストアに登録
+        self.browser.page().profile().cookieStore().setCookie(cookie)
+        
     def capture_current_url(self):
         """Alt + C相当：現在のURLをJSONに保存"""
         url = get_portal_url() # これは外部関数として維持でOK
@@ -517,21 +538,21 @@ class ResidentMiniPlayer(QMainWindow):
         if not os.path.exists(PROFILE_DIR): os.makedirs(PROFILE_DIR)
         self.profile = QWebEngineProfile("PortalResidentStorage", self)
         self.profile.setPersistentStoragePath(PROFILE_DIR)
+
+        self.ua_desktop = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        self.profile.setHttpUserAgent(self.ua_desktop)
         
-        # --- 追加: セキュリティ設定の緩和 ---
+        # --- セキュリティ設定の緩和 ---
         s = self.profile.settings()
         s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
-        # クロスドメイン制限やローカルアクセス制限を緩和してJSの干渉力を強める
         s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
         s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
         s.setAttribute(QWebEngineSettings.WebAttribute.ErrorPageEnabled, True)
-        # --- ここまで ---
 
         self.page = QWebEnginePage(self.profile, self)
         self.browser = QWebEngineView()
         self.browser.setPage(self.page)
         
-        # コンテキストメニューなどは維持
         self.browser.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.browser.installEventFilter(self)
         self.page.loadFinished.connect(self._install_proxy_filter)
@@ -632,10 +653,51 @@ class ResidentMiniPlayer(QMainWindow):
             self.inject_adblock()
             # ユーザーに知らせる（ステータスバーがある場合）
             self.statusBar().showMessage("Settings reloaded and applied!", 3000)
+            
+            
+            
 
     def _install_proxy_filter(self):
+        """読み込み完了時に呼ばれる。イベントフィルタの設置とデスクトップ表示の強制を行う"""
         if self.browser.focusProxy():
             self.browser.focusProxy().installEventFilter(self)
+        # ページ読み込み完了時にデスクトップ化を実行
+        self._force_desktop_layout()
+
+    def _force_desktop_layout(self):
+        if not hasattr(self, 'page') or self.page is None or self.width() <= 800:
+            return
+
+        script = """
+        (function() {
+            // 1. YouTubeのモバイル専用要素を隠す
+            var m_web = document.getElementsByTagName('ytm-app')[0];
+            if (m_web) { m_web.style.display = 'none'; }
+
+            // 2. Cookieの再セット
+            document.cookie = "PREF=f6=40000; domain=.youtube.com; path=/";
+            
+            // 3. YouTubeの内部フラグ書き換え
+            if (window.yt && window.yt.config_) {
+                window.yt.config_.EXPERIMENT_FLAGS.kevlar_is_mweb_modern_f_and_e_interaction = false;
+            }
+            
+            // 4. ViewportをPCサイズで固定（再定義）
+            var meta = document.querySelector('meta[name="viewport"]');
+            if (meta) { 
+                meta.setAttribute('content', 'width=1280, initial-scale=1.0');
+            } else {
+                var newMeta = document.createElement('meta');
+                newMeta.name = "viewport";
+                newMeta.content = "width=1280";
+                document.getElementsByTagName('head')[0].appendChild(newMeta);
+            }
+
+            // 5. YouTubeに「画面が変わったぞ」と叫ぶ
+            window.dispatchEvent(new Event('resize'));
+        })();
+        """
+        self.page.runJavaScript(script)
 
     def _setup_ui(self):
         central_widget = QWidget()
@@ -823,9 +885,6 @@ class ResidentMiniPlayer(QMainWindow):
             self.hit_label.setText("0/0")
 
     def eventFilter(self, obj, event):
-        from PyQt6.QtCore import QEvent
-        from PyQt6.QtGui import QKeyEvent
-        
         if event.type() == QEvent.Type.KeyPress:
             key = event.key()
             modifiers = event.modifiers()
@@ -990,18 +1049,31 @@ class ResidentMiniPlayer(QMainWindow):
         finally:
             self.setUpdatesEnabled(True)
             self.browser.update()
+            preset_idx = self.config_manager.data["app_settings"]["last_active_preset_index"]
+            # 現在のサイズインデックスを保存
+            self.config_manager.data["presets"][preset_idx]["last_location_index"] = self.current_location_index
+            self.config_manager.save_config() # JSONへ書き出し
 
     def apply_config_geometry(self):
-        """現在のインデックスに基づき、JSONから座標・サイズ・不透明度を読み込んで適用する"""
         try:
             data = self.config_manager.data
-            idx = data["app_settings"].get("last_active_preset_index", 0)
-            loc = data["presets"][idx]["locations"][self.current_location_index]
-            # 座標とサイズの適用
+            p_idx = data["app_settings"].get("last_active_preset_index", 0)
+            preset = data["presets"][p_idx]
+            
+            loc = preset["locations"][self.current_location_index]
             self.setGeometry(loc["x"], loc["y"], loc["width"], loc["height"])
-            # 不透明度の適用
-            opacity = loc.get("opacity", 1.0)
-            self.setWindowOpacity(opacity)
+            self.setWindowOpacity(loc.get("opacity", 1.0))
+            
+            # --- ここがポイント：リロードせず、表示を最適化する ---
+            if self.width() > 800:
+                # 横長の場合：ズームを少し下げて「広大なデスクトップ」に見せかける
+                # 1.0(標準)だと427px判定されるため、0.8～0.9程度に設定
+                self.browser.setZoomFactor(0.8)
+                self._force_desktop_layout()
+            else:
+                # 縦長（小窓）の場合：標準のズームに戻す
+                self.browser.setZoomFactor(1.0)
+                
         except (IndexError, KeyError) as e:
             print(f"Failed to apply geometry: {e}")
     
@@ -1336,10 +1408,19 @@ class ResidentMiniPlayer(QMainWindow):
             print("No specific settings for this domain.")
 
     def _on_load_finished(self, ok):
-        """ページ読み込み完了時、およびURL変更時に実行"""
+        """ページ読み込み完了時に実行"""
         if ok:
+            # 1. サイト固有のカスタマイズ（広告ブロック等）を適用
             self._apply_site_customizations()
+            
+            # 2. 横長の場合、再度デスクトップ化を強制
+            if self.width() > 800:
+                self._force_desktop_layout()
+                
+            # 3. 1秒後にもう一度ダメ押し（動的な要素の読み込み待ち）
             QTimer.singleShot(1000, self._apply_site_customizations)
+            if self.width() > 800:
+                QTimer.singleShot(1500, self._force_desktop_layout)
             
 class FloatingNotification(QWidget):
     def __init__(self, text, color="#00FF00", duration=2500, parent=None):

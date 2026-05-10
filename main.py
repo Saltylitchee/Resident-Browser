@@ -311,7 +311,7 @@ class FloatingNotification(QWidget):
         self.animation.finished.connect(self.close)
         self.animation.start()
 
-class ClickableLabel(QLabel):
+class IndicatorWidget(QLabel):
     clicked = pyqtSignal(str)
 
     def __init__(self, text, parent=None):
@@ -324,16 +324,13 @@ class ClickableLabel(QLabel):
         self._bg_alpha = 220  # 0 (透明) - 255 (不透明)
         self._shape = "rounded_rect"
 
-    def set_custom_style(self, text_color, bg_color, shape, bg_alpha):
-        """
-        config.json から取得したスタイルを適用する。
-        bg_alpha: 0-255 の整数
-        """
-        self._text_color = text_color
-        self._bg_color = bg_color
-        self._shape = shape
-        self._bg_alpha = max(0, min(255, int(bg_alpha))) # 範囲外の値をガード
-        self.update() # paintEventをトリガー
+    def apply_indicator_styles(self, styles: dict):
+        # デフォルト値の管理をこちらに集約
+        self._text_color = styles.get("text_color", "#00FF00")
+        self._bg_color = styles.get("bg_color", "#2C3E50")
+        self._shape = styles.get("shape", "rounded_rect")
+        self._bg_alpha = styles.get("indicator_bg_alpha", 220)
+        self.update()
 
     def paintEvent(self, event):
         """背景・枠線・形状のカスタム描画"""
@@ -409,11 +406,30 @@ class ClickableLabel(QLabel):
             self.clicked.emit("title")
             
 class ResidentMiniPlayer(QMainWindow):
+    MAX_FAVORITES = 5
     # --- 設定値へのアクセスをプロパティ化 ---
     @property
     def app_settings(self):
         """アプリ全体の共通設定を取得"""
         return self.config_manager.data.get("app_settings", {})
+    
+    @property
+    def reserved_shortcut_keys(self):
+        """
+        設定されているショートカットキー（Qt.Key）のセットを返す。
+        一度計算したらキャッシュし、設定変更時のみ再計算する。
+        """
+        if hasattr(self, "_shortcut_cache"):
+            return self._shortcut_cache
+
+        shortcuts = self.app_settings.get("shortcuts", {})
+        self._shortcut_cache = set() # 検索が高速な set を使用
+        for action_name, key_char in shortcuts.items():
+            if action_name == "modifier": continue
+            target_key = getattr(Qt.Key, f"Key_{key_char.upper()}", None)
+            if target_key:
+                self._shortcut_cache.add(target_key)
+        return self._shortcut_cache
 
     @property
     def current_preset(self):
@@ -424,6 +440,11 @@ class ResidentMiniPlayer(QMainWindow):
             return data["presets"][idx]
         except (IndexError, KeyError):
             return {}
+        
+    @property
+    def presets(self):
+        """全プリセットのリストを返すプロパティ"""
+        return self.config_manager.data.get("presets", [])
 
     @property
     def layout_threshold(self):
@@ -437,7 +458,6 @@ class ResidentMiniPlayer(QMainWindow):
     
     def __init__(self, config_manager, selector_manager):
         super().__init__()
-        # --- 1. すべてのインスタンス変数を「最初」に初期化する ---
         self.config_manager = config_manager
         self.selector_manager = selector_manager
         self.current_mode = DisplayMode.EXPANDED
@@ -448,9 +468,8 @@ class ResidentMiniPlayer(QMainWindow):
         self._last_processed_title = ""
         self._last_search_query = ""
         # データの準備
-        config_data = self.config_manager.data
-        self._current_preset_idx = config_data["app_settings"].get("last_active_preset_index", 0)
-        self.current_location_index = config_data["presets"][self._current_preset_idx].get("last_location_index", 0)
+        self._current_preset_idx = self.app_settings.get("last_active_preset_index", 0)
+        self.current_location_index = self.current_preset.get("last_location_index", 0)
         # --- 2. UIとブラウザのセットアップ ---
         self.setWindowTitle("Doppel")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
@@ -467,13 +486,14 @@ class ResidentMiniPlayer(QMainWindow):
         self.browser.loadFinished.connect(self._on_load_finished)
         # --- 5. URLのロード ---
         def start_initial_load():
-            preset = config_data["presets"][self._current_preset_idx]
+            preset = self.current_preset
             if self.width() > self.layout_threshold:
                 self._set_desktop_cookie_directly()
-                self.browser.setZoomFactor(0.8)
+                self.browser.setZoomFactor(self.desktop_zoom_default)
                 self.profile.setHttpUserAgent(self.ua_desktop)
-            if preset.get("last_url"):
-                url_str = str(preset["last_url"])
+            last_url = preset.get("last_url")
+            if last_url:
+                url_str = str(last_url)
                 # URLに字幕オフのパラメータを追加
                 # cc_load_policy=0: 字幕をデフォルトで非表示にする
                 if "?" in url_str:
@@ -551,60 +571,50 @@ class ResidentMiniPlayer(QMainWindow):
         
     def capture_current_url(self):
         """Alt + C相当：現在のURLをJSONに保存"""
-        url = get_portal_url() # これは外部関数として維持でOK
+        url = get_portal_url()
         if not url: return
-
-        # セルフ（自分自身）のコンフィグを更新
-        data = self.config_manager.data
-        idx = data["app_settings"]["last_active_preset_index"]
-        
-        if 0 <= idx < len(data["presets"]):
-            data["presets"][idx]["last_url"] = url
+        # --- 1. プロパティを使って「現在のプリセット」に直接アクセス ---
+        # self.current_preset は内部で config_manager.data["presets"][idx] を参照している
+        preset = self.current_preset
+        if preset: # プリセットが存在すれば
+            # --- 2. 辞書の内容を書き換える ---
+            # 辞書(dict)は参照渡しなので、presetを書き換えれば大元のdataも書き換わります
+            preset["last_url"] = url
+            # --- 3. 保存を実行 ---
             self.config_manager.save_config()
             self._display_preset_notification("★Target URL Saved!")
 
     def apply_url_from_dispatch(self):
         """Alt + V相当：クリップボードまたは履歴からURLを展開"""
-        data = self.config_manager.data
-        idx = data["app_settings"]["last_active_preset_index"]
-        preset = data["presets"][idx]
-        
+        # これだけで「現在アクティブなプリセットの辞書」が手に入ります！
+        # idx を取得する工程すら不要になります。
+        preset = self.current_preset
         # 座標適用
         self.apply_config_geometry()
-        
         clipboard = QApplication.clipboard()
         text = clipboard.text().strip()
-        
         if text.startswith("http"):
             target_url = text
             clipboard.clear()
             self._display_preset_notification("★URL Loaded from Clipboard")
         else:
+            # preset はすでに「今のプリセット」を指しているのでそのまま使えます
             target_url = preset.get("last_url", "https://www.google.com")
             self._display_preset_notification("★URL Restored from History")
-
         self.browser.setUrl(QUrl(target_url))
-        self.update_display_mode(DisplayMode.EXPANDED) # 貼り付けたら即・小窓へ
+        self.update_display_mode(DisplayMode.EXPANDED)
         
     def _display_preset_notification(self, text):
         """現在のプリセット設定に基づいた通知を表示する"""
         # 1. 表示設定のチェック
-        settings = self.config_manager.data.get("app_settings", {})
-        if not settings.get("show_notifications", True):
+        # self.app_settings プロパティを使用
+        if not self.app_settings.get("show_notifications", True):
             return
         # 2. スタイルデータの抽出
-        try:
-            data = self.config_manager.data
-            idx = settings.get("last_active_preset_index", 0)
-            # プリセットリストが空の場合の安全策
-            preset = data.get("presets", [{}])[idx]
-            styles = preset.get("indicator_styles", {})
-        except (IndexError, TypeError):
-            styles = {}
-        # 3. 色の決定（個別設定 > インジケーター設定 > デフォルト値 の優先順位）
-        # notification_color が無ければ text_color を、それも無ければ SpringGreen を使う
+        # self.current_preset プロパティを使用
+        styles = self.current_preset.get("indicator_styles", {})
+        # 3. 色の決定
         text_color = styles.get("notification_color") or styles.get("text_color") or "#00FF7F"
-        # notif_bg_color が無ければ 濃いグレー を使う
         bg_color = styles.get("notif_bg_color", "#2C3E50")
         # 4. 通知インスタンスの生成と表示
         bg_alpha = styles.get("notif_bg_alpha", 220)
@@ -616,84 +626,56 @@ class ResidentMiniPlayer(QMainWindow):
         )
         
     def apply_preset(self, index):
-        data = self.config_manager.data
-        if index >= len(data["presets"]): return
-
-        self.save_current_state() # 現在の状態を保存
-        
-        data["app_settings"]["last_active_preset_index"] = index
-        target_preset = data["presets"][index]
-        
-        # UI更新の同期
-        self.refresh_favorites_ui()       # お気に入りボタンを再描画
-        self.apply_config_geometry()      # 本体のサイズ・位置更新
-        self._update_indicator_with_state("stopped") # インジケーター外観更新
-        
-        # コンテンツのロード
-        last_url = target_preset.get("last_url", "https://www.google.com")
+        # 1. ガード（範囲チェック）: 全プリセットのリスト（self.presets）に対して行う
+        if index < 0 or index >= len(self.presets):
+            return
+        # 2. 状態の保存（切り替え前のデータを確定させる）
+        self.save_current_state()
+        # 3. インデックスの更新（書き込み）
+        # これを更新した瞬間、プロパティ self.current_preset が指す先が切り替わります！
+        self.app_settings["last_active_preset_index"] = index
+        # 4. 同期とロード
+        # 以前のように target_preset という一時変数を作らなくても
+        # self.current_preset と書くだけで常に「新しい方」を参照できる
+        self.refresh_favorites_ui()
+        self.apply_config_geometry()
+        self._update_indicator_with_state("stopped")
+        # URLのロード（プロパティから直接取得）
+        last_url = self.current_preset.get("last_url", "https://www.google.com")
         self.browser.setUrl(QUrl(last_url))
-        
+        # 5. 永続化と通知
         self.config_manager.save_config()
-        self._display_preset_notification(f"Switch -> {target_preset['name']}")
-        
-    def update_indicator_style(self):
-        """
-        現在のプリセットに応じたインジケーターのスタイル（色など）を適用
-        """
-        data = self.config_manager.data
-        idx = data["app_settings"].get("last_active_preset_index", 0)
-        
-        # プリセットごとにテーマカラーを持たせる拡張を見越した実装
-        # （現在は暫定で固定、またはプリセット名に応じて色を変える等）
-        preset_name = data["presets"][idx].get("name", "")
-        
-        # 例：特定のワードが含まれていたら色を変える、といった遊び心も可能
-        color = "#3a8fb7" # デフォルト
-        if "YouTube" in preset_name: color = "#ff0000"
-        elif "Work" in preset_name: color = "#2ecc71"
-
-        self.indicator.setStyleSheet(f"""
-            background-color: {color};
-            border-radius: 5px;
-        """)
+        self._display_preset_notification(f"Switch -> {self.current_preset['name']}")
         
         
         
         
     def refresh_favorites_ui(self):
         """現在のプリセットに基づいてお気に入りボタンを再生成する"""
-        # 1. 既存のボタンを削除
+        # 1. 既存のボタンを削除（ここはそのまま）
         while self.fav_layout.count():
             item = self.fav_layout.takeAt(0)
             widget = item.widget()
             if widget:
                 widget.deleteLater()
 
-        # 2. 現在のプリセットからお気に入りリストを取得
-        data = self.config_manager.data
-        idx = data["app_settings"].get("last_active_preset_index", 0)
-        
-        try:
-            current_preset = data["presets"][idx]
-            favorites = current_preset.get("favorites", []) # リストを取得
-            
-            # 3. リスト内の全URLに対してボタンを生成
-            for url in favorites[:5]:
-                # ドメインの頭文字をラベルにする（例: https://github.com -> G）
-                display_text = url.replace("https://", "").replace("http://", "").replace("www.", "")[0].upper()
-                
-                btn = QPushButton(display_text)
-                btn.setFixedSize(24, 24)
-                btn.setToolTip(url)
-                btn.setStyleSheet(self._get_fav_btn_style())
-                
-                # 重要: 引数 u=url を使って現在のループの値を固定（クロージャ対策）
-                btn.clicked.connect(lambda checked, u=url: self.browser.setUrl(QUrl(u)))
-                
-                self.fav_layout.addWidget(btn)
-                
-        except (IndexError, KeyError) as e:
-            print(f"Error loading favorites: {e}")
+        # 2. プロパティを使用して「今のお気に入り」を直接取得
+        favorites = self.current_preset.get("favorites", [])
+
+        # 3. リスト内の全URLに対してボタンを生成（最大5件）
+        for url in favorites[:self.MAX_FAVORITES]:
+            # 修正ポイント：ロジックが複雑に見える場合は、一時変数で意味を明確にする
+            domain_part = url.replace("https://", "").replace("http://", "").replace("www.", "")
+            display_text = domain_part[0].upper() if domain_part else "?"
+
+            btn = QPushButton(display_text)
+            btn.setFixedSize(24, 24)
+            btn.setToolTip(url)
+            btn.setStyleSheet(self._get_fav_btn_style())
+
+            # クロージャ対策：u=url は非常に重要なテクニックです！
+            btn.clicked.connect(lambda checked, u=url: self.browser.setUrl(QUrl(u)))
+            self.fav_layout.addWidget(btn)
 
     def _get_fav_btn_style(self):
         """お気に入りボタンのスタイルを返す（保守性のため分離）"""
@@ -1079,58 +1061,66 @@ class ResidentMiniPlayer(QMainWindow):
         # 検索実行
         self.browser.findText(text, flags, self._update_hit_count)
 
+    def _is_reserved_shortcut(self, key):
+        """押されたキーが設定済みのショートカットかどうかを判定する"""
+        shortcuts = self.app_settings.get("shortcuts", {})
+        # 文字列をQtKeyに変換する処理を効率化（例：1回だけ変換して使い回すのが理想）
+        for key_char in shortcuts.values():
+            if isinstance(key_char, str):
+                target_key = getattr(Qt.Key, f"Key_{key_char.upper()}", None)
+                if key == target_key:
+                    return True
+        return False
+
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.KeyPress:
-            key = event.key()
-            modifiers = event.modifiers()
-            
-            # --- 1. Control キーとの組み合わせ ---
-            if modifiers & Qt.KeyboardModifier.ControlModifier:
-                # 検索バーのトグル（Ctrl+F）
-                if key == Qt.Key.Key_F:
-                    self.toggle_search_container() # メソッド化して共通利用
-                    return True
-                # リロード（Ctrl+R）
-                elif key == Qt.Key.Key_R:
-                    self.browser.reload()
-                    return True
+        if event.type() != QEvent.Type.KeyPress:
+            return super().eventFilter(obj, event)
 
-            # --- 2. Alt キーとの組み合わせ ---
-            if modifiers & Qt.KeyboardModifier.AltModifier:
-                # ブラウザバック（Alt+←）
-                if key == Qt.Key.Key_Left:
-                    self.browser.back()
-                    return True
-                # ブラウザ進む（Alt+→）
-                elif key == Qt.Key.Key_Right:
-                    self.browser.forward()
-                    return True
-                
-                # 【追加：動的ショートカットのブロック】
-                # config から設定を読み込み、登録されているキーなら入力を無視する
-                shortcuts = self.config_manager.data["app_settings"].get("shortcuts", {})
-                
-                # A. 文字キー (w, s, c, v, d など) の判定
-                # shortcuts の値（"s"など）を Qt.Key 定数に変換して比較
-                for action_name, key_char in shortcuts.items():
-                    if action_name == "modifier": continue
-                    # 文字列（"s"）を Qt.Key.Key_S 等の定数名に変換して取得
-                    target_key = getattr(Qt.Key, f"Key_{key_char.upper()}", None)
-                    if target_key and key == target_key:
-                        return True # 入力欄に文字が渡るのを防ぐ
-                # B. 数字キー (1-9) の判定（プリセット切り替え用）
+        key = event.key()
+        modifiers = event.modifiers()
+        is_alt = modifiers & Qt.KeyboardModifier.AltModifier
+        is_ctrl = modifiers & Qt.KeyboardModifier.ControlModifier
+
+        # --- 1. Control系 (固定) ---
+        if is_ctrl:
+            if key == Qt.Key.Key_F:
+                self.toggle_search_container()
+                return True
+            if key == Qt.Key.Key_R:
+                self.browser.reload()
+                return True
+
+        # --- 2. Alt系 (動的・プリセット) ---
+        if is_alt:
+            # A. ブラウザナビゲーション
+            if key == Qt.Key.Key_Left:
+                self.browser.back()
+                return True
+            if key == Qt.Key.Key_Right:
+                self.browser.forward()
+                return True
+
+            # B. 数字キーショートカット (有効時のみ)
+            # 設定値（例: enable_number_shortcuts）が True の場合のみ判定
+            if self.app_settings.get("enable_number_shortcuts", True):
                 if Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+                    # ここでプリセット切り替えロジックを呼ぶ
+                    self._switch_preset_by_index(key - Qt.Key.Key_1) 
                     return True
 
-            # --- 3. 特定ウィジェットに対する個別処理 ---
-            if obj == self.search_bar:
-                if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                    self._handle_search_enter()
-                    return True
-                elif key == Qt.Key.Key_Escape:
-                    if self.search_container.isVisible():
-                        self.toggle_search_container()
-                        return True
+            # C. その他の動的ショートカットのブロック
+            # キャッシュ済みのセットを使うので、ループを回す必要がなく高速
+            if key in self.reserved_shortcut_keys:
+                return True
+
+        # --- 3. ウィジェット個別処理 (検索バーなど) ---
+        if obj == self.search_bar:
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._handle_search_enter()
+                return True
+            if key == Qt.Key.Key_Escape:
+                self.toggle_search_container()
+                return True
 
         return super().eventFilter(obj, event)
 
@@ -1451,16 +1441,11 @@ class ResidentMiniPlayer(QMainWindow):
 
     # --- 担当1：見た目（スタイル） ---
     def _apply_indicator_style(self, styles, scale):
-        text_color = styles.get("text_color", "#00FF00")
-        bg_color = styles.get("bg_color", "#2C3E50")
-        shape = styles.get("shape", "rounded_rect")
-        alpha = styles.get("indicator_bg_alpha", 220)
+        # 1. 描画クラスへ丸ごと投げる（詳細は向こうにお任せ）
+        self.collapsed_indicator.apply_indicator_styles(styles)
+        # 2. Player側でしか使わない font_size などの計算だけを行う
+        text_color = styles.get("text_color", "#00FF00") # CSS反映用に取得
         font_size = int(10 * scale)
-
-        # カスタムペイント（背景）の更新
-        self.collapsed_indicator.set_custom_style(text_color, bg_color, shape, alpha)
-        
-        # ラベルの文字装飾
         label_style = f"color: {text_color}; font-weight: bold; font-size: {font_size}pt; background: transparent; border: none;"
         self.icon_label.setStyleSheet(label_style)
         self.text_label.setStyleSheet(label_style)
@@ -1519,7 +1504,7 @@ class ResidentMiniPlayer(QMainWindow):
     # --- インジケーターの生成補助 ---
     def _ensure_indicator_exists(self, scale):
         if not self.collapsed_indicator:
-            self.collapsed_indicator = ClickableLabel("", None)
+            self.collapsed_indicator = IndicatorWidget("", None)
             self.collapsed_indicator.setWindowFlags(
                 Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
             )

@@ -455,6 +455,7 @@ class ResidentMiniPlayer(QMainWindow):
         self.load_selectors()
         self.reload_shortcut = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
         self.reload_shortcut.activated.connect(self.reload_and_apply)
+        self._last_processed_title = ""
         
     def handle_show_request(self):
         """
@@ -1359,8 +1360,7 @@ class ResidentMiniPlayer(QMainWindow):
 
     # --- インジケーター更新の司令塔 ---
     def _update_indicator_with_state(self, state):
-        """【司令塔】データの準備を行い、各担当メソッドを順に実行する"""
-        # 1. データの準備
+        """【最適化版司令塔】状態変化に応じて、更新の範囲を最小限に抑える"""
         state = state if state in ['playing', 'paused'] else 'stopped'
         data = self.config_manager.data
         try:
@@ -1373,19 +1373,29 @@ class ResidentMiniPlayer(QMainWindow):
         scale = data["app_settings"].get("global_indicator_scale", 1.0)
         shape = styles.get("shape", "rounded_rect")
 
-        # 2. インジケーターの生成（未作成時のみ）
         self._ensure_indicator_exists(scale)
 
-        # 3. 描画更新を一時停止
+        # --- ここからが「ビクッ」を止める魔法 ---
+        
+        # すでに表示されており、かつ「タイトルが変わっていない」なら、アイコンだけ更新して終了
+        # これにより、全体の再配置（setGeometry）をスキップできる
+        current_raw_title = self.browser.title()
+        if self.collapsed_indicator.isVisible() and hasattr(self, '_last_processed_title'):
+            if self._last_processed_title == current_raw_title:
+                # アイコンの文字だけを差し替え（これなら一瞬も消えない）
+                icon = {"playing": "♪", "paused": "||"}.get(state, "❏")
+                self.icon_label.setText(icon)
+                return 
+
+        # タイトルが変わっている場合や、初回表示時はフル更新を実行
+        self._last_processed_title = current_raw_title
+        
         self.collapsed_indicator.setUpdatesEnabled(False)
-
-        # 4. 役割ごとにメソッドを呼び出す
-        self._apply_indicator_style(styles, scale)        # 見た目担当
-        self._set_indicator_content(state, styles)       # 中身担当
-        self._finalize_indicator_geometry(shape, scale)  # 配置担当
-
-        # 5. 描画再開と表示
+        self._apply_indicator_style(styles, scale)
+        self._set_indicator_content(state, styles)
+        self._finalize_indicator_geometry(shape, scale)
         self.collapsed_indicator.setUpdatesEnabled(True)
+
         if not self.collapsed_indicator.isVisible():
             self.collapsed_indicator.show()
         self.collapsed_indicator.raise_()

@@ -61,8 +61,9 @@ class ConfigManager:
             "show_notifications": True,
             "last_active_preset_index": 0,
             "global_indicator_scale": 1.0,
-            "selectors_url": None,
+            "layout_threshold": 600,
             "search_mode": "google",
+            "selectors_url": None,
             "developer_notes": {
                 "reference_url": "https://gemini.google.com/app",
                 "last_modified": "2026-05-10"
@@ -79,7 +80,11 @@ class ConfigManager:
         "presets": [
             {
                 "name": "デフォルト",
-                "last_url": "https://www.google.com",
+                "last_url": "https://youtube.com",
+                "favorites": [
+                    "https://www.youtube.com/",
+                    "https://gemini.google.com/app"
+                ],
                 "base_width": 400,
                 "indicator_styles": {
                     "shape": "rounded_rect",
@@ -1176,11 +1181,17 @@ class ResidentMiniPlayer(QMainWindow):
         self.config_manager.save_config()
         self._display_preset_notification("★New Size Pattern Locked & Added!")
         
-    def adjust_zoom(self):
+    def adjust_zoom(self, force_desktop=False):
         """現在のウィンドウ幅に基づき、プリセットごとの基準幅(base_width)に合わせてズームを調整"""
         # 初期化前や設定マネージャーがない場合はスキップ
         if not hasattr(self, 'config_manager') or self.config_manager is None:
             return
+        if force_desktop:
+            # デスクトップ版を維持するための「魔法の数字」
+            # 0.8以下にすると、多くのサイトは「十分な幅がある」と誤認してくれます
+            self.browser.setZoomFactor(0.8)
+            return
+        
         new_width = self.width()
         # 前回の幅と同じなら処理しない（無駄な計算を回避）
         if hasattr(self, '_last_zoom_width') and self._last_zoom_width == new_width:
@@ -1305,17 +1316,15 @@ class ResidentMiniPlayer(QMainWindow):
         self._update_geometry_if_unlocked()
 
     def resizeEvent(self, event):
-        """ウィンドウサイズが変わったときに呼ばれるイベント（最終統合版）"""
         super().resizeEvent(event)
-        # 1. 座標の更新（既存ロジック）
         self._update_geometry_if_unlocked()
-        # 2. 表示モード（デスクトップ/モバイル）の切り替え
-        # リロードが発生しないため、リサイズ中に呼んでも軽快です
-        target_mode = "desktop" if self.width() > self.layout_threshold else "mobile"
+        # 1. 閾値でモードを決定
+        is_desktop = self.width() > self.layout_threshold
+        target_mode = "desktop" if is_desktop else "mobile"
+        # 2. ViewportやYouTube固有のフラグをセット
         self.set_view_mode(target_mode)
-        # 3. 基準幅に基づいた精密なズーム調整（既存ロジックを再利用）
-        # これにより、config.jsonのbase_width設定が活かされます
-        self.adjust_zoom()
+        # 3. ズーム調整。デスクトップ版なら「固定」、モバイルなら「動的」に切り替える
+        self.adjust_zoom(force_desktop=is_desktop)
         
     def closeEvent(self, event):
         # 終了時にURLと最新座標をまとめてファイル保存

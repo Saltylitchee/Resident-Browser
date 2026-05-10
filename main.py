@@ -14,7 +14,7 @@ from enum import Enum, auto
 from PyQt6.QtNetwork import QNetworkCookie
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QPushButton, QStatusBar, QMainWindow, QLabel
+    QLineEdit, QPushButton, QMainWindow, QLabel
 )
 from PyQt6.QtCore import (
     Qt, QUrl, QEvent, QTimer, QObject, pyqtSignal, QPropertyAnimation, QEasingCurve, QByteArray, QRect, QSize
@@ -80,7 +80,7 @@ class ConfigManager:
             {
                 "name": "デフォルト",
                 "last_url": "https://www.google.com",
-                "base_width": 500,
+                "base_width": 400,
                 "indicator_styles": {
                     "shape": "rounded_rect",
                     "max_title_length": 25,
@@ -410,10 +410,12 @@ class ResidentMiniPlayer(QMainWindow):
         self.config_manager = config_manager
         self.selector_manager = selector_manager
         self.current_mode = DisplayMode.EXPANDED
-        self._is_switching_mode = False  # ここに移動！
+        self._is_switching_mode = False
         self.collapsed_indicator = None
         self.all_selectors = {}
         self.current_location_index = 0
+        self._last_processed_title = ""
+        self._last_search_query = ""
         # データの準備
         config_data = self.config_manager.data
         self._current_preset_idx = config_data["app_settings"].get("last_active_preset_index", 0)
@@ -435,7 +437,7 @@ class ResidentMiniPlayer(QMainWindow):
         # --- 5. URLのロード ---
         def start_initial_load():
             preset = config_data["presets"][self._current_preset_idx]
-            if self.width() > 800:
+            if self.width() > self.layout_threshold:
                 self._set_desktop_cookie_directly()
                 self.browser.setZoomFactor(0.8)
                 self.profile.setHttpUserAgent(self.ua_desktop)
@@ -455,7 +457,6 @@ class ResidentMiniPlayer(QMainWindow):
         self.load_selectors()
         self.reload_shortcut = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
         self.reload_shortcut.activated.connect(self.reload_and_apply)
-        self._last_processed_title = ""
         
     def handle_show_request(self):
         """
@@ -583,33 +584,24 @@ class ResidentMiniPlayer(QMainWindow):
             bg_alpha=bg_alpha
         )
         
-        
-        
     def apply_preset(self, index):
-        """
-        指定されたインデックスのプリセットをアプリ全体に適用する
-        """
         data = self.config_manager.data
-        # ガード：存在しないインデックスが指定された場合
-        if index >= len(data["presets"]):
-            self._display_preset_notification(f"Preset {index + 1} not defined.")
-            return
-        # 1. 切り替える前に、現在の（古い）プリセットの状態を保存
-        self.save_current_state()
-        # 2. 設定データの更新
+        if index >= len(data["presets"]): return
+
+        self.save_current_state() # 現在の状態を保存
+        
         data["app_settings"]["last_active_preset_index"] = index
-        # プリセットを跨ぐ際、サイズパターンのインデックスは 0（メインサイズ）に戻す
-        self.current_location_index = 0 
-        # 3. UIと外観の同期
-        self.refresh_favorites_ui()       # お気に入りボタン更新
-        self.apply_config_geometry()      # 位置・サイズ更新
-        self.update_indicator_style()     # インジケーターの色更新
-        # 4. コンテンツのロード
-        # プリセットに記録されている最後のURLを復元
         target_preset = data["presets"][index]
+        
+        # UI更新の同期
+        self.refresh_favorites_ui()       # お気に入りボタンを再描画
+        self.apply_config_geometry()      # 本体のサイズ・位置更新
+        self._update_indicator_with_state("stopped") # インジケーター外観更新
+        
+        # コンテンツのロード
         last_url = target_preset.get("last_url", "https://www.google.com")
         self.browser.setUrl(QUrl(last_url))
-        # 5. 設定の永続化
+        
         self.config_manager.save_config()
         self._display_preset_notification(f"Switch -> {target_preset['name']}")
         
@@ -638,37 +630,39 @@ class ResidentMiniPlayer(QMainWindow):
         
         
     def refresh_favorites_ui(self):
-        """
-        現在のプリセットに基づいてお気に入りボタンを再生成する
-        """
-        # 1. 既存のボタンを安全に削除
-        # レイアウト内のアイテムを後ろから順番に削除していくのがQtの定石です
+        """現在のプリセットに基づいてお気に入りボタンを再生成する"""
+        # 1. 既存のボタンを削除
         while self.fav_layout.count():
             item = self.fav_layout.takeAt(0)
             widget = item.widget()
             if widget:
-                widget.deleteLater() # メモリ解放
+                widget.deleteLater()
 
-        # 2. 現在のプリセット情報を取得
-        config_data = self.config_manager.data
-        idx = config_data["app_settings"].get("last_active_preset_index", 0)
+        # 2. 現在のプリセットからお気に入りリストを取得
+        data = self.config_manager.data
+        idx = data["app_settings"].get("last_active_preset_index", 0)
         
         try:
-            current_preset = config_data["presets"][idx]
-            favs = current_preset.get("favorites", [])
+            current_preset = data["presets"][idx]
+            favorites = current_preset.get("favorites", []) # リストを取得
             
-            # 3. 新しいボタンを生成して追加
-            for url in favs[:2]:
-                display_text = url.replace("https://", "").replace("www.", "")[0].upper()
-                btn = QPushButton(display_text) 
+            # 3. リスト内の全URLに対してボタンを生成
+            for url in favorites[:5]:
+                # ドメインの頭文字をラベルにする（例: https://github.com -> G）
+                display_text = url.replace("https://", "").replace("http://", "").replace("www.", "")[0].upper()
+                
+                btn = QPushButton(display_text)
                 btn.setFixedSize(24, 24)
                 btn.setToolTip(url)
-                btn.setStyleSheet(self._get_fav_btn_style()) # スタイルも共通化
+                btn.setStyleSheet(self._get_fav_btn_style())
+                
+                # 重要: 引数 u=url を使って現在のループの値を固定（クロージャ対策）
                 btn.clicked.connect(lambda checked, u=url: self.browser.setUrl(QUrl(u)))
+                
                 self.fav_layout.addWidget(btn)
                 
         except (IndexError, KeyError) as e:
-            print(f"Error refreshing favorites: {e}")
+            print(f"Error loading favorites: {e}")
 
     def _get_fav_btn_style(self):
         """お気に入りボタンのスタイルを返す（保守性のため分離）"""
@@ -681,9 +675,6 @@ class ResidentMiniPlayer(QMainWindow):
             }
             QPushButton:hover { background-color: #e0e0e0; }
         """
-        
-        
-        
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -696,6 +687,7 @@ class ResidentMiniPlayer(QMainWindow):
         self.profile = QWebEngineProfile("PortalResidentStorage", self)
         self.profile.setPersistentStoragePath(PROFILE_DIR)
 
+        self.layout_threshold = 800
         self.ua_desktop = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         self.profile.setHttpUserAgent(self.ua_desktop)
         
@@ -810,9 +802,6 @@ class ResidentMiniPlayer(QMainWindow):
             self.inject_adblock()
             # ユーザーに知らせる（ステータスバーがある場合）
             self.statusBar().showMessage("Settings reloaded and applied!", 3000)
-            
-            
-            
 
     def _install_proxy_filter(self):
         """読み込み完了時に呼ばれる。イベントフィルタの設置とデスクトップ表示の強制を行う"""
@@ -822,7 +811,7 @@ class ResidentMiniPlayer(QMainWindow):
         self._force_desktop_layout()
 
     def _force_desktop_layout(self):
-        if not hasattr(self, 'page') or self.page is None or self.width() <= 800:
+        if not hasattr(self, 'page') or self.page is None or self.width() <= self.layout_threshold:
             return
 
         script = """
@@ -881,68 +870,43 @@ class ResidentMiniPlayer(QMainWindow):
         self.page.runJavaScript(script)
 
     def _setup_ui(self):
+        # --- 1. 状態の初期化 ---
+        self.search_mode = "google"
+        config_data = self.config_manager.data
+        saved_mode = config_data["app_settings"].get("search_mode", "google")
+        
+        # --- 2. UIの構築 ---
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        # --- 検索バーコンテナ ---
+
+        # 検索バーコンテナ
         self.search_container = QWidget()
         self.search_container.setStyleSheet("background: #f0f0f0; border-bottom: 1px solid #ccc;")
         self.search_container.setMaximumHeight(40)
         s_layout = QHBoxLayout(self.search_container)
         s_layout.setContentsMargins(5, 2, 5, 2)
         s_layout.setSpacing(5)
-        s_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
+        # モード切替ボタン
         self.mode_toggle = QPushButton("[G]")
         self.mode_toggle.setFixedSize(30, 24)
-        self.mode_toggle.setStyleSheet("background-color: #4285f4; color: white; font-weight: bold; border: none; border-radius: 3px;")
         self.mode_toggle.clicked.connect(self.toggle_search_mode)
         s_layout.addWidget(self.mode_toggle)
 
+        # 検索バー本体
         self.search_bar = QLineEdit()
         self.search_bar.installEventFilter(self)
-        self.search_bar.setPlaceholderText("Google Search...")
         self.search_bar.returnPressed.connect(self._handle_search_enter)
         s_layout.addWidget(self.search_bar)
 
         # お気に入りグループ
         self.fav_group = QWidget()
-        fav_layout = QHBoxLayout(self.fav_group)
-        fav_layout.setContentsMargins(0,0,0,0)
-        fav_layout.setSpacing(5)
-
-        # ConfigManagerから現在のプリセットを取得
-        config_data = self.config_manager.data
-        idx = config_data["app_settings"].get("last_active_preset_index", 0)
-        
-        # 範囲チェックを行い安全にプリセットを取得
-        if 0 <= idx < len(config_data["presets"]):
-            current_preset = config_data["presets"][idx]
-            favs = current_preset.get("favorites", [])
-            
-            for url in favs[:2]:  # 上位2つを表示
-                # ドメインの頭文字を取得
-                display_text = url.replace("https://", "").replace("www.", "")[0].upper()
-                btn = QPushButton(display_text) 
-                btn.setFixedSize(24, 24)
-                btn.setToolTip(url)
-                btn.setStyleSheet("""
-                    QPushButton {
-                        background-color: white; 
-                        border: 1px solid #ccc; 
-                        border-radius: 3px; 
-                        font-weight: bold;
-                    }
-                    QPushButton:hover {
-                        background-color: #e0e0e0;
-                    }
-                """)
-                # クロージャの問題を避けるため、デフォルト引数 u=url を使用
-                btn.clicked.connect(lambda checked, u=url: self.browser.setUrl(QUrl(u)))
-                self.fav_layout.addWidget(btn)
-        
+        self.fav_layout = QHBoxLayout(self.fav_group)
+        self.fav_layout.setContentsMargins(0, 0, 0, 0)
+        self.fav_layout.setSpacing(5)
         s_layout.addWidget(self.fav_group)
 
         # ページ内検索グループ
@@ -950,7 +914,7 @@ class ResidentMiniPlayer(QMainWindow):
         find_layout = QHBoxLayout(self.find_group)
         find_layout.setContentsMargins(0,0,0,0)
         find_layout.setSpacing(5)
-
+        
         self.hit_label = QLabel("0/0")
         self.hit_label.setFixedWidth(40) # 幅を固定してガタつき防止
         self.hit_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -968,102 +932,122 @@ class ResidentMiniPlayer(QMainWindow):
         
         find_layout.addWidget(btn_prev)
         find_layout.addWidget(btn_next)
+        
         s_layout.addWidget(self.find_group)
         self.find_group.hide()
 
         layout.addWidget(self.search_container)
-        self.search_container.hide()
-        
+        self.search_container.hide() # 初期状態は隠す
+
+        # 【超重要】ブラウザをレイアウトに追加
+        # これがないと画面がグレーのままになります
         layout.addWidget(self.browser)
-        self.statusBar = QStatusBar()
-        self.setStatusBar(self.statusBar)
-        self.search_mode = "google"
-        
-        # 初期状態の検索モード復元
-        saved_mode = config_data["app_settings"].get("search_mode", "google")
+
+        # --- 3. 状態の反映 ---
         if saved_mode == "find":
+            self.search_mode = "google" 
             self.toggle_search_mode()
         else:
-            self.search_bar.setPlaceholderText("Google Search...")
-
-        layout.addWidget(self.search_container)
-        layout.addWidget(self.browser)
+            self.refresh_favorites_ui()
+            # [G] モードのスタイルを適用
+            self.mode_toggle.setText("[G]")
+            self.mode_toggle.setStyleSheet("background-color: #4285f4; color: white; font-weight: bold; border: none; border-radius: 3px;")
         
     def toggle_search_mode(self):
-        """トグルボタンでモードを切り替える"""
+        """Google検索モード[G]とページ内検索モード[F]を切り替える"""
         if self.search_mode == "google":
+            # ページ内検索モード [F] へ
             self.search_mode = "find"
             self.mode_toggle.setText("[F]")
-            self.mode_toggle.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold; border-radius: 3px;")
+            self.mode_toggle.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold; border: none; border-radius: 3px;")
             self.search_bar.setPlaceholderText("Find in page...")
             self.fav_group.hide()
             self.find_group.show()
         else:
+            # Google検索モード [G] へ
             self.search_mode = "google"
             self.mode_toggle.setText("[G]")
-            self.mode_toggle.setStyleSheet("background-color: #4285f4; color: white; font-weight: bold; border-radius: 3px;")
+            self.mode_toggle.setStyleSheet("background-color: #4285f4; color: white; font-weight: bold; border: none; border-radius: 3px;")
             self.search_bar.setPlaceholderText("Google Search...")
-            self.find_group.hide()
             self.fav_group.show()
-        
-        # 修正：ConfigManagerを使用して保存
+            self.find_group.hide()
+            self.refresh_favorites_ui()
+
+        # 設定を保存
         self.config_manager.data["app_settings"]["search_mode"] = self.search_mode
         self.config_manager.save_config()
-        
+        self.search_bar.clear()
         self.search_bar.setFocus()
-
+        
     def _handle_search_enter(self):
-        """Enterキーで検索実行 / URL判定"""
-        text = self.search_bar.text().strip()
-        if not text: return
-
+        """
+        1. 入力値のバリデーション
+        2. 検索モードによる分岐
+        A. Googleモード: URL判定 or 検索クエリ発行
+        B. ページ内検索モード: 検索実行
+        """
+        query = self.search_bar.text().strip()
+        if not query:
+            return
         if self.search_mode == "google":
-            # URLかどうかの判定
-            is_url = text.startswith(('http://', 'https://')) or ('.' in text and ' ' not in text)
-            
-            if is_url:
-                target_url = text if text.startswith(('http://', 'https://')) else f"https://{text}"
-                
-                # YouTube Live等の外部ブラウザ転送判定
-                if any(x in target_url for x in ["youtube.com/live/", "youtu.be/live/"]):
-                    import webbrowser
-                    webbrowser.open(target_url)
-                    self.search_container.hide()
-                    return 
-                
-                self.browser.setUrl(QUrl(target_url))
-            else:
-                url = f"https://www.google.com/search?q={text}"
-                self.browser.setUrl(QUrl(url))
-            
-            self.search_container.hide()
-            self.browser.setFocus()
-            
+            self._process_web_navigation(query)
         else:
-            # ページ内検索モード（Shift押下で逆方向）
-            modifiers = QApplication.keyboardModifiers()
-            is_shift = modifiers & Qt.KeyboardModifier.ShiftModifier
-            self._find_with_count(backward=bool(is_shift))
+            # 1. 検索ワードが「前回と違う」場合
+            if query != self._last_search_query:
+                self._last_search_query = query
+                self.browser.findText("") 
+                self._find_with_count(backward=False)
+            # 2. 検索ワードが「前回と同じ」場合（「次へ」の挙動）
+            else:
+                self._process_in_page_search()
+
+    def _process_web_navigation(self, text):
+        """URLか検索語かを判定し、適切なアクション（遷移/外部起動）を実行"""
+        # URL判定ロジックをここに集約
+        is_url = text.startswith(('http://', 'https://')) or ('.' in text and ' ' not in text)
+        if is_url:
+            target_url = text if text.startswith(('http://', 'https://')) else f"https://{text}"
+            # YouTube Live等の外部ブラウザ転送判定
+            if any(x in target_url for x in ["youtube.com/live/", "youtu.be/live/"]):
+                import webbrowser
+                webbrowser.open(target_url)
+                self.search_container.hide()
+                return 
+            self.browser.setUrl(QUrl(target_url))
+        else:
+            url = f"https://www.google.com/search?q={text}"
+            self.browser.setUrl(QUrl(url))
+        self.search_container.hide()
+        self.browser.setFocus()
+
+    def _process_in_page_search(self):
+        """現在のキー入力状態（Shift）を確認し、ページ内検索を実行"""
+        modifiers = QApplication.keyboardModifiers()
+        is_backward = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        self._find_with_count(backward=is_backward)
+
+    def _update_hit_count(self, result):
+        """
+        UIパーツの存在確認（防御的プログラミング）を行い、表示を更新。
+        採用担当者の視点：パーツの有無をチェックすることで、UI変更時のクラッシュを防ぐ。
+        """
+        # 存在確認のロジック
+        if not hasattr(self, 'hit_label') or self.hit_label is None:
+            print("Warning: hit_label is not initialized.")
+            return
+        num_matches = result.numberOfMatches()
+        active_index = result.activeMatch()
+        # 表示ロジック
+        text = f"{active_index}/{num_matches}" if num_matches > 0 else "0/0"
+        self.hit_label.setText(text)
         
     def _find_with_count(self, backward=False):
         text = self.search_bar.text()
         flags = QWebEnginePage.FindFlag(0)
         if backward:
             flags |= QWebEnginePage.FindFlag.FindBackward
-        
         # 検索実行
         self.browser.findText(text, flags, self._update_hit_count)
-
-    def _update_hit_count(self, result):
-        """検索結果（件数情報）をラベルに反映"""
-        num_matches = result.numberOfMatches() 
-        active_index = result.activeMatch() 
-
-        if num_matches > 0:
-            # インデックスは0開始のため、表示は +1 する
-            self.hit_label.setText(f"{active_index + 1}/{num_matches}")
-        else:
-            self.hit_label.setText("0/0")
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:
@@ -1091,14 +1075,28 @@ class ResidentMiniPlayer(QMainWindow):
                 elif key == Qt.Key.Key_Right:
                     self.browser.forward()
                     return True
+                
+                # 【追加：動的ショートカットのブロック】
+                # config から設定を読み込み、登録されているキーなら入力を無視する
+                shortcuts = self.config_manager.data["app_settings"].get("shortcuts", {})
+                
+                # A. 文字キー (w, s, c, v, d など) の判定
+                # shortcuts の値（"s"など）を Qt.Key 定数に変換して比較
+                for action_name, key_char in shortcuts.items():
+                    if action_name == "modifier": continue
+                    # 文字列（"s"）を Qt.Key.Key_S 等の定数名に変換して取得
+                    target_key = getattr(Qt.Key, f"Key_{key_char.upper()}", None)
+                    if target_key and key == target_key:
+                        return True # 入力欄に文字が渡るのを防ぐ
+                # B. 数字キー (1-9) の判定（プリセット切り替え用）
+                if Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+                    return True
 
             # --- 3. 特定ウィジェットに対する個別処理 ---
             if obj == self.search_bar:
-                # エンターキーで検索実行
                 if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                     self._handle_search_enter()
                     return True
-                # Escapeで検索バーを閉じる
                 elif key == Qt.Key.Key_Escape:
                     if self.search_container.isVisible():
                         self.toggle_search_container()
@@ -1192,8 +1190,8 @@ class ResidentMiniPlayer(QMainWindow):
             data = self.config_manager.data
             idx = data["app_settings"].get("last_active_preset_index", 0)
             preset = data["presets"][idx]
-            # 2. 基準幅(base_width)を取得（未設定なら500pxをデフォルトに）
-            base_width = preset.get("base_width", 500)
+            # 2. 基準幅(base_width)を取得（未設定なら400pxをデフォルトに）
+            base_width = preset.get("base_width", 400)
             # 3. ズーム倍率を計算
             zoom_level = new_width / base_width
             # 極端な数値にならないよう制限（0.4倍〜2.0倍）
@@ -1245,7 +1243,7 @@ class ResidentMiniPlayer(QMainWindow):
             self.setWindowOpacity(loc.get("opacity", 1.0))
             
             # --- ここがポイント：リロードせず、表示を最適化する ---
-            if self.width() > 800:
+            if self.width() > self.layout_threshold:
                 # 横長の場合：ズームを少し下げて「広大なデスクトップ」に見せかける
                 # 1.0(標準)だと427px判定されるため、0.8～0.9程度に設定
                 self.browser.setZoomFactor(0.8)
@@ -1307,17 +1305,43 @@ class ResidentMiniPlayer(QMainWindow):
         self._update_geometry_if_unlocked()
 
     def resizeEvent(self, event):
-        """ウィンドウサイズが変わったときに呼ばれるイベント（統合版）"""
+        """ウィンドウサイズが変わったときに呼ばれるイベント（最終統合版）"""
         super().resizeEvent(event)
-        # 1. ロックされていなければ、現在のサイズをメモリに反映
+        # 1. 座標の更新（既存ロジック）
         self._update_geometry_if_unlocked()
-        # 2. ウィンドウ幅に合わせてコンテンツのズームを調整
+        # 2. 表示モード（デスクトップ/モバイル）の切り替え
+        # リロードが発生しないため、リサイズ中に呼んでも軽快です
+        target_mode = "desktop" if self.width() > self.layout_threshold else "mobile"
+        self.set_view_mode(target_mode)
+        # 3. 基準幅に基づいた精密なズーム調整（既存ロジックを再利用）
+        # これにより、config.jsonのbase_width設定が活かされます
         self.adjust_zoom()
         
     def closeEvent(self, event):
         # 終了時にURLと最新座標をまとめてファイル保存
         self.save_current_state()
         super().closeEvent(event)
+        
+    def set_view_mode(self, mode="desktop"):
+        """レイアウトの土台をJSで整える（ズーム操作はadjust_zoomに任せる）"""
+        # YouTube等の個別調整
+        if mode == "desktop":
+            self._force_desktop_layout()
+        # Viewportの書き換え（Gemini等にPC版だと思い込ませる）
+        viewport_content = "width=1280, initial-scale=1.0" if mode == "desktop" else "width=device-width, initial-scale=1.0"
+        script = f"""
+        (function() {{
+            var meta = document.querySelector('meta[name="viewport"]');
+            if (!meta) {{
+                meta = document.createElement('meta');
+                meta.name = "viewport";
+                document.getElementsByTagName('head')[0].appendChild(meta);
+            }}
+            meta.setAttribute('content', '{viewport_content}');
+            window.dispatchEvent(new Event('resize'));
+        }})();
+        """
+        self.page.runJavaScript(script)
         
     def show_floating_notification(self, text):
         # 1. 全体設定で通知がオフなら何もしない
@@ -1609,12 +1633,12 @@ class ResidentMiniPlayer(QMainWindow):
             self._apply_site_customizations()
             
             # 2. 横長の場合、再度デスクトップ化を強制
-            if self.width() > 800:
+            if self.width() > self.layout_threshold:
                 self._force_desktop_layout()
                 
             # 3. 1秒後にもう一度ダメ押し（動的な要素の読み込み待ち）
             QTimer.singleShot(1000, self._apply_site_customizations)
-            if self.width() > 800:
+            if self.width() > self.layout_threshold:
                 QTimer.singleShot(1500, self._force_desktop_layout)
 
     def show_notification(self, duration):

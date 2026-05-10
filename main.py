@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QStatusBar, QMainWindow, QLabel
 )
 from PyQt6.QtCore import (
-    Qt, QUrl, QEvent, QTimer, QObject, pyqtSignal, QPropertyAnimation, QEasingCurve, QByteArray, QRect
+    Qt, QUrl, QEvent, QTimer, QObject, pyqtSignal, QPropertyAnimation, QEasingCurve, QByteArray, QRect, QSize
 )
 from PyQt6.QtGui import QCursor, QPainter, QBrush, QColor, QPen, QShortcut, QKeySequence
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -66,6 +66,14 @@ class ConfigManager:
             "developer_notes": {
                 "reference_url": "https://gemini.google.com/app",
                 "last_modified": "2026-05-10"
+            },
+            "shortcuts": { # ここもファイルに合わせて追加
+                "modifier": "alt",
+                "hide_completely": "w",
+                "show_toggle": "s",
+                "copy": "c",
+                "paste": "v",
+                "cycle_size": "d"
             }
         },
         "presets": [
@@ -75,16 +83,21 @@ class ConfigManager:
                 "base_width": 500,
                 "indicator_styles": {
                     "shape": "rounded_rect",
+                    "max_title_length": 25,
                     "text_color": "#00FF00",
-                    "bg_color": "#2C3E50",
+                    "bg_color": "#000000",
+                    "indicator_bg_alpha": 220,
                     "notification_color": "#00FF00",
-                    "notif_bg_color": "#440000"
+                    "notif_bg_color": "#3A01C1",
+                    "notif_bg_alpha": 220
                 },
                 "locations": [
                     { "x": 100, "y": 100, "width": 400, "height": 300, "opacity": 1.0, "is_locked": True }
-                ]
+                ],
+                "last_location_index": 0
             }
-        ]
+        ],
+        "search_mode": "google"
     }
 
     def __init__(self, config_path="config.json"):
@@ -200,10 +213,24 @@ class SelectorManager:
     
     
 class FloatingNotification(QWidget):
-    def __init__(self, text, color="#00FF7F", bg_color="#2C3E50", duration=2000):
+    def __init__(self, text, color="#00FF7F", bg_color="#2C3E50", bg_alpha=220, duration=2000):
         super().__init__(None)
+        
+        # 属性の保持
+        self.text = text
+        self.accent_color = color
         self.bg_color = bg_color
-        # 1. 基本属性：最前面表示、枠なし、クリック透過、タスクバー非表示
+        self.bg_alpha = bg_alpha # 0-255 で指定
+        
+        self._init_window_attributes()
+        self._setup_ui()
+        self._setup_animation()
+        
+        # 実行
+        self.start_show(duration)
+
+    def _init_window_attributes(self):
+        """ウィンドウの振る舞いを設定"""
         self.setWindowFlags(
             Qt.WindowType.Tool | 
             Qt.WindowType.FramelessWindowHint | 
@@ -212,13 +239,22 @@ class FloatingNotification(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        # 2. UIデザイン：モダンな半透明ブラック
+
+    def _setup_ui(self):
+        """UIコンポーネントの構築と色設定"""
         layout = QVBoxLayout(self)
-        self.label = QLabel(text)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.label = QLabel(self.text)
+        
+        # 背景色のRGBA化（alphaをconfigから反映）
+        c = QColor(self.bg_color)
+        rgba_bg = f"rgba({c.red()}, {c.green()}, {c.blue()}, {self.bg_alpha})"
+        
         self.label.setStyleSheet(f"""
-            background-color: rgba(20, 20, 20, 220); 
-            color: {color}; 
-            border: 1px solid {color};
+            background-color: {rgba_bg}; 
+            color: {self.accent_color}; 
+            border: 1px solid {self.accent_color};
             border-radius: 8px;
             padding: 10px 20px;
             font-weight: bold;
@@ -227,45 +263,48 @@ class FloatingNotification(QWidget):
         """)
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.label)
-        # 3. 位置設定：画面の中央上部へ配置
+
+        # サイズと位置の確定
         self.adjustSize()
-        screen = QApplication.primaryScreen().geometry()
-        self.move((screen.width() - self.width()) // 2, 80)
-        # 4. アニメーション：フェードイン・アウト
+        screen_geo = QApplication.primaryScreen().availableGeometry()
+        x = (screen_geo.width() - self.width()) // 2
+        y = 80
+        self.move(x, y)
+
+    def _setup_animation(self):
+        """フェードアニメーション設定"""
         self.setWindowOpacity(0.0)
         self.animation = QPropertyAnimation(self, b"windowOpacity")
         self.animation.setDuration(300)
         self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        # 5. 実行シーケンス
-        self.start_show(duration)
-        
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # configから渡された背景色を使用
-        bg = QColor(self.bg_color)
-        bg.setAlpha(230) 
-        painter.setBrush(bg)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(self.rect(), 10, 10)
+
+    # paintEvent は setStyleSheet で代用できるため削除しました
 
     def start_show(self, duration):
-        """フェードイン -> 待機 -> フェードアウト の流れ"""
+        """フェードイン -> 待機 -> フェードアウト"""
         self.show()
-        # フェードイン
+        self.animation.stop() # 念のため停止
         self.animation.setStartValue(0.0)
         self.animation.setEndValue(1.0)
+        self.animation.setDirection(QPropertyAnimation.Direction.Forward)
         self.animation.start()
+        
         # 指定時間後にフェードアウトを開始
         QTimer.singleShot(duration, self.start_fade_out)
 
     def start_fade_out(self):
         """フェードアウトして閉じる"""
+        # アニメーションが実行中なら一旦停止
+        if self.animation.state() == QPropertyAnimation.State.Running:
+            self.animation.stop()
+            
         self.animation.setDirection(QPropertyAnimation.Direction.Backward)
+        # 以前の接続があれば解除（多重接続防止）
+        try: self.animation.finished.disconnect()
+        except: pass
+        
         self.animation.finished.connect(self.close)
         self.animation.start()
-
-
 
 class ClickableLabel(QLabel):
     clicked = pyqtSignal(str)
@@ -273,36 +312,47 @@ class ClickableLabel(QLabel):
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        # デフォルト値
+        
+        # 内部状態の初期値（config読み込みまでの安全なデフォルト）
         self._text_color = "#00FF00"
         self._bg_color = "#2C3E50"
+        self._bg_alpha = 220  # 0 (透明) - 255 (不透明)
         self._shape = "rounded_rect"
 
-    def set_custom_style(self, text_color, bg_color, shape):
-        """外部からスタイルを更新するためのメソッド"""
+    def set_custom_style(self, text_color, bg_color, shape, bg_alpha):
+        """
+        config.json から取得したスタイルを適用する。
+        bg_alpha: 0-255 の整数
+        """
         self._text_color = text_color
         self._bg_color = bg_color
         self._shape = shape
-        self.update()  # 再描画を強制
+        self._bg_alpha = max(0, min(255, int(bg_alpha))) # 範囲外の値をガード
+        self.update() # paintEventをトリガー
 
     def paintEvent(self, event):
+        """背景・枠線・形状のカスタム描画"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.rect().adjusted(1, 1, -1, -1)
+        
+        # 境界線の太さ（2px）を考慮して、描画範囲を少し内側に絞る
+        pen_width = 2
+        rect = self.rect().adjusted(pen_width, pen_width, -pen_width, -pen_width)
 
-        # 設定から色を取得
-        bg_color = QColor(self._bg_color)
-        bg_color.setAlpha(230) # 透明度を維持
-        border_color = QColor(self._text_color)
+        # 色オブジェクトの生成（config値を適用）
+        bg = QColor(self._bg_color)
+        bg.setAlpha(self._bg_alpha) # ここでconfigの透明度を反映
+        
+        border = QColor(self._text_color)
 
-        # 背景と枠線の描画
-        painter.setBrush(QBrush(bg_color))
-        pen = QPen(border_color)
-        pen.setWidth(2)
+        # ブラシ（塗りつぶし）とペン（枠線）の設定
+        painter.setBrush(QBrush(bg))
+        pen = QPen(border)
+        pen.setWidth(pen_width)
         painter.setPen(pen)
 
+        # 形状に基づく描画ロジック
         if self._shape == "circle":
-            # 正円にするために、幅と高さの短い方に合わせる
             side = min(rect.width(), rect.height())
             circle_rect = QRect(
                 rect.left() + (rect.width() - side) // 2,
@@ -313,24 +363,45 @@ class ClickableLabel(QLabel):
         elif self._shape == "rect":
             painter.drawRect(rect)
         elif self._shape == "capsule":
-            # 半径を高さの半分にすることでカプセル型になる
             radius = rect.height() // 2
             painter.drawRoundedRect(rect, radius, radius)
-        else:  # rounded_rect
+        else:  # rounded_rect (デフォルト)
             painter.drawRoundedRect(rect, 15, 15)
         
         painter.end()
+        
+        # 最後に親の paintEvent を呼び、上にテキストを描画させる
         super().paintEvent(event)
         
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            # 判定基準を固定の45ではなく、現在の幅の割合にするか、
-            # あるいは親から icon_width をもらって判定するのがスマートです
-            icon_area_width = self.layout().contentsMargins().left() + 30 # 大よその目安
-            if event.pos().x() < icon_area_width:
+        """
+        クリックされた座標に基づき、'icon' 領域か 'title' 領域かを判定して発火。
+        """
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        # Circleモードの場合は、形状全体をひとつのボタン（icon扱い）として処理
+        if self._shape == "circle":
+            self.clicked.emit("icon")
+            return
+
+        # 動的な境界判定：最初のウィジェット（アイコンラベル）の右端を境界とする
+        layout = self.layout()
+        if layout and layout.count() > 0:
+            margin_left = layout.contentsMargins().left()
+            icon_item = layout.itemAt(0).widget()
+            
+            # アイコンウィジェットが存在すればその幅を、無ければデフォルト30を使用
+            icon_w = icon_item.width() if icon_item else 30
+            boundary = margin_left + icon_w
+            
+            if event.pos().x() < boundary:
                 self.clicked.emit("icon")
             else:
                 self.clicked.emit("title")
+        else:
+            # レイアウトが未構築の場合は安全のため title 扱いにする
+            self.clicked.emit("title")
             
 class ResidentMiniPlayer(QMainWindow):
     def __init__(self, config_manager, selector_manager):
@@ -391,7 +462,7 @@ class ResidentMiniPlayer(QMainWindow):
         何を表示するか、どのモードにするかはクラス自身が判断する。
         """
         if not self.has_valid_content():
-            self.show_floating_notify("No URL to show. Press Alt+C.")
+            self._display_preset_notification("No URL to show. Press Alt+C.")
             return
 
         # モードのトグル
@@ -422,7 +493,7 @@ class ResidentMiniPlayer(QMainWindow):
             elif target_mode == DisplayMode.HIDDEN:
                 self.hide()
                 self.current_mode = DisplayMode.HIDDEN
-                self.show_floating_notify("★Stealth Mode Activated") # 潜伏したことを通知
+                self._display_preset_notification("★Stealth Mode Activated") # 潜伏したことを通知
 
         finally:
             QTimer.singleShot(500, self._reset_transition_flag)
@@ -457,7 +528,7 @@ class ResidentMiniPlayer(QMainWindow):
         if 0 <= idx < len(data["presets"]):
             data["presets"][idx]["last_url"] = url
             self.config_manager.save_config()
-            self.show_floating_notify("★Target URL Saved!")
+            self._display_preset_notification("★Target URL Saved!")
 
     def apply_url_from_dispatch(self):
         """Alt + V相当：クリップボードまたは履歴からURLを展開"""
@@ -474,35 +545,42 @@ class ResidentMiniPlayer(QMainWindow):
         if text.startswith("http"):
             target_url = text
             clipboard.clear()
-            self.show_floating_notify("★URL Loaded from Clipboard")
+            self._display_preset_notification("★URL Loaded from Clipboard")
         else:
             target_url = preset.get("last_url", "https://www.google.com")
-            self.show_floating_notify("★URL Restored from History")
+            self._display_preset_notification("★URL Restored from History")
 
         self.browser.setUrl(QUrl(target_url))
         self.update_display_mode(DisplayMode.EXPANDED) # 貼り付けたら即・小窓へ
         
-    def show_floating_notify(self, text):
-        """通知の表示（プリセットごとの背景色を適用）"""
-        # 1. 通知のオンオフ設定を確認
-        show_notif = self.config_manager.data["app_settings"].get("show_notifications", True)
-        if not show_notif:
+    def _display_preset_notification(self, text):
+        """現在のプリセット設定に基づいた通知を表示する"""
+        # 1. 表示設定のチェック
+        settings = self.config_manager.data.get("app_settings", {})
+        if not settings.get("show_notifications", True):
             return
-        # 2. 現在のプリセットから背景色と文字色を取得
+        # 2. スタイルデータの抽出
         try:
             data = self.config_manager.data
-            idx = data["app_settings"].get("last_active_preset_index", 0)
-            styles = data["presets"][idx].get("indicator_styles", {})
-            # 通知の文字色（基本はインジケーターの文字色と同じ）
-            text_color = styles.get("text_color", "#00FF7F")
-            # 通知の背景色（設定がなければデフォルトの濃いグレー）
-            bg_color = styles.get("notif_bg_color", "#2C3E50") 
-        except (KeyError, IndexError):
-            text_color = "#00FF7F"
-            bg_color = "#2C3E50"
-        # 3. FloatingNotification側に背景色を渡す
-        # （FloatingNotification側の__init__が背景色を受け取れるよう修正が必要です）
-        self._last_notification = FloatingNotification(text, color=text_color, bg_color=bg_color)
+            idx = settings.get("last_active_preset_index", 0)
+            # プリセットリストが空の場合の安全策
+            preset = data.get("presets", [{}])[idx]
+            styles = preset.get("indicator_styles", {})
+        except (IndexError, TypeError):
+            styles = {}
+        # 3. 色の決定（個別設定 > インジケーター設定 > デフォルト値 の優先順位）
+        # notification_color が無ければ text_color を、それも無ければ SpringGreen を使う
+        text_color = styles.get("notification_color") or styles.get("text_color") or "#00FF7F"
+        # notif_bg_color が無ければ 濃いグレー を使う
+        bg_color = styles.get("notif_bg_color", "#2C3E50")
+        # 4. 通知インスタンスの生成と表示
+        bg_alpha = styles.get("notif_bg_alpha", 220)
+        self._last_notification = FloatingNotification(
+            text, 
+            color=text_color, 
+            bg_color=bg_color,
+            bg_alpha=bg_alpha
+        )
         
         
         
@@ -513,7 +591,7 @@ class ResidentMiniPlayer(QMainWindow):
         data = self.config_manager.data
         # ガード：存在しないインデックスが指定された場合
         if index >= len(data["presets"]):
-            self.show_floating_notify(f"Preset {index + 1} not defined.")
+            self._display_preset_notification(f"Preset {index + 1} not defined.")
             return
         # 1. 切り替える前に、現在の（古い）プリセットの状態を保存
         self.save_current_state()
@@ -532,7 +610,7 @@ class ResidentMiniPlayer(QMainWindow):
         self.browser.setUrl(QUrl(last_url))
         # 5. 設定の永続化
         self.config_manager.save_config()
-        self.show_floating_notify(f"Switch -> {target_preset['name']}")
+        self._display_preset_notification(f"Switch -> {target_preset['name']}")
         
     def update_indicator_style(self):
         """
@@ -1079,7 +1157,7 @@ class ResidentMiniPlayer(QMainWindow):
             idx = data["app_settings"].get("last_active_preset_index", 0)
             target_preset = data["presets"][idx]
         except (IndexError, KeyError):
-            self.show_floating_notify("Error: Preset not found.")
+            self._display_preset_notification("Error: Preset not found.")
             return
         # 2. 現在のウィンドウ情報を取得
         geo = self.geometry()
@@ -1097,7 +1175,7 @@ class ResidentMiniPlayer(QMainWindow):
         target_preset["locations"].append(new_loc)
         # 4. 保存と通知
         self.config_manager.save_config()
-        self.show_floating_notify("★New Size Pattern Locked & Added!")
+        self._display_preset_notification("★New Size Pattern Locked & Added!")
         
     def adjust_zoom(self):
         """現在のウィンドウ幅に基づき、プリセットごとの基準幅(base_width)に合わせてズームを調整"""
@@ -1137,14 +1215,14 @@ class ResidentMiniPlayer(QMainWindow):
             idx = data["app_settings"].get("last_active_preset_index", 0)
             locations = data["presets"][idx].get("locations", [])
             if not locations:
-                self.show_floating_notify("No size patterns found.")
+                self._display_preset_notification("No size patterns found.")
                 return
             # 2. インデックスを次に進める（ループ処理）
             self.current_location_index = (self.current_location_index + 1) % len(locations)
             # 3. 新しい位置・サイズを適用
             self.apply_config_geometry()
             # 4. 通知を表示
-            self.show_floating_notify(f"Size: {self.current_location_index + 1}/{len(locations)}")
+            self._display_preset_notification(f"Size: {self.current_location_index + 1}/{len(locations)}")
         except Exception as e:
             print(f"Error in cycle_geometry: {e}")
         finally:
@@ -1250,41 +1328,40 @@ class ResidentMiniPlayer(QMainWindow):
         # 3. 通知を表示
         self.notif = FloatingNotification(text, color=n_color)
         
-        
-        
-        
     def _handle_audio_status(self, audible):
-        """音が止まってもインジケーターは消さず、状態（アイコン）だけ更新する"""
-        if not self.isVisible():
-            # 音が止まった（一時停止した）瞬間に、アイコンを ♪ から || に変えるために再描画
+        """音が止まっても消さず、アイコン状態のみ更新"""
+        if not self.isVisible() and self.collapsed_indicator and self.collapsed_indicator.isVisible():
             self._show_indicator()
 
     def _on_title_changed(self, title):
-        # hasattr を使うことで、変数が存在しない場合のクラッシュを防ぐ
+        """タイトル変更時、インジケーター表示中なら更新"""
         if not hasattr(self, 'collapsed_indicator') or self.collapsed_indicator is None:
             return
-        """動画が切り替わるなどしてタイトルが変わった時の処理"""
-        # インジケーターが表示されている（格納状態である）時だけ更新をかける
-        if self.collapsed_indicator and self.collapsed_indicator.isVisible():
+        if self.collapsed_indicator.isVisible():
             self._show_indicator()
 
     def _show_indicator(self):
+        """JSで再生状態を取得し、更新メソッドへ渡す"""
         js_code = """
         (function() {
-            // 画面上に実際に見えている（表示サイズがある）ビデオ要素を探す
             var videos = Array.from(document.querySelectorAll('video'));
             var activeVideo = videos.find(v => v.offsetWidth > 0 && v.offsetHeight > 0);
-            
             if (!activeVideo) return 'none';
             return activeVideo.paused ? 'paused' : 'playing';
         })();
         """
         self.browser.page().runJavaScript(js_code, self._update_indicator_with_state)
-        
-        
-        
 
+    # --- エラー修正用：フラグリセットメソッド ---
+    def _reset_transition_flag(self):
+        """トグル処理中のロックを解除する"""
+        self._is_switching_mode = False
+
+    # --- インジケーター更新の司令塔 ---
     def _update_indicator_with_state(self, state):
+        """【司令塔】データの準備を行い、各担当メソッドを順に実行する"""
+        # 1. データの準備
+        state = state if state in ['playing', 'paused'] else 'stopped'
         data = self.config_manager.data
         try:
             idx = data["app_settings"].get("last_active_preset_index", 0)
@@ -1294,199 +1371,170 @@ class ResidentMiniPlayer(QMainWindow):
         
         styles = preset.get("indicator_styles", {})
         scale = data["app_settings"].get("global_indicator_scale", 1.0)
-        
+        shape = styles.get("shape", "rounded_rect")
+
+        # 2. インジケーターの生成（未作成時のみ）
+        self._ensure_indicator_exists(scale)
+
+        # 3. 描画更新を一時停止
+        self.collapsed_indicator.setUpdatesEnabled(False)
+
+        # 4. 役割ごとにメソッドを呼び出す
+        self._apply_indicator_style(styles, scale)        # 見た目担当
+        self._set_indicator_content(state, styles)       # 中身担当
+        self._finalize_indicator_geometry(shape, scale)  # 配置担当
+
+        # 5. 描画再開と表示
+        self.collapsed_indicator.setUpdatesEnabled(True)
+        if not self.collapsed_indicator.isVisible():
+            self.collapsed_indicator.show()
+        self.collapsed_indicator.raise_()
+
+    # --- 担当1：見た目（スタイル） ---
+    def _apply_indicator_style(self, styles, scale):
         text_color = styles.get("text_color", "#00FF00")
         bg_color = styles.get("bg_color", "#2C3E50")
         shape = styles.get("shape", "rounded_rect")
-        scaled_font_size = int(10 * scale)
+        alpha = styles.get("indicator_bg_alpha", 220)
+        font_size = int(10 * scale)
 
-        # 2. インジケーターの生成
+        # カスタムペイント（背景）の更新
+        self.collapsed_indicator.set_custom_style(text_color, bg_color, shape, alpha)
+        
+        # ラベルの文字装飾
+        label_style = f"color: {text_color}; font-weight: bold; font-size: {font_size}pt; background: transparent; border: none;"
+        self.icon_label.setStyleSheet(label_style)
+        self.text_label.setStyleSheet(label_style)
+
+    # --- 担当2：中身（コンテンツ） ---
+    def _set_indicator_content(self, state, styles):
+        # アイコンの決定
+        icon = {"playing": "♪", "paused": "||"}.get(state, "❏")
+        self.icon_label.setText(icon)
+
+        # タイトルの加工
+        raw_title = self.browser.title()
+        clean_title = re.sub(r'^\(\d+\)\s*', '', raw_title)
+        if not clean_title or clean_title == "about:blank": clean_title = "Doppel"
+        
+        # プリセットごとの最大長さを取得
+        max_len = styles.get("max_title_length", 25)
+        
+        if len(clean_title) > max_len:
+            display_title = clean_title[:max_len] + "..."
+        else:
+            display_title = clean_title
+        self.text_label.setText(display_title)
+
+    # --- 担当3：配置（ジオメトリ） ---
+    def _finalize_indicator_geometry(self, shape, scale):
+        if shape == "circle":
+            self.text_label.hide()
+            size = int(50 * scale)
+            target_size = QSize(size, size)
+            self.icon_label.setFixedWidth(size)
+        else:
+            self.text_label.show()
+            # リサイズのために制約を一旦リセット
+            self.collapsed_indicator.setFixedSize(QSize(-1, -1))
+            self.collapsed_indicator.setMinimumSize(int(80 * scale), 0)
+            self.icon_label.setFixedWidth(int(30 * scale))
+            
+            # 余白設定
+            m = (int(12*scale), int(5*scale), int(15*scale), int(5*scale))
+            self.collapsed_indicator.layout().setContentsMargins(*m)
+            
+            # 【重要】内容に基づいてサイズを計算
+            self.collapsed_indicator.layout().activate()
+            target_size = self.collapsed_indicator.layout().sizeHint()
+
+        # 右下座標の計算
+        screen = QApplication.primaryScreen().availableGeometry()
+        new_x = screen.right() - target_size.width() - 15
+        new_y = screen.bottom() - target_size.height() - 15
+
+        # 位置とサイズを同時に確定（震え防止）
+        self.collapsed_indicator.setGeometry(new_x, new_y, target_size.width(), target_size.height())
+        self.collapsed_indicator.setFixedSize(target_size)
+
+    # --- インジケーターの生成補助 ---
+    def _ensure_indicator_exists(self, scale):
         if not self.collapsed_indicator:
             self.collapsed_indicator = ClickableLabel("", None)
             self.collapsed_indicator.setWindowFlags(
-                Qt.WindowType.FramelessWindowHint | 
-                Qt.WindowType.WindowStaysOnTopHint | 
-                Qt.WindowType.Tool
+                Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
             )
             self.collapsed_indicator.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-            
             layout = QHBoxLayout(self.collapsed_indicator)
-            layout.setSpacing(int(5 * scale)) # アイコンとテキストの間隔を明示
+            layout.setSpacing(int(8 * scale))
             self.icon_label = QLabel() 
             self.text_label = QLabel()
+            self.text_label.setWordWrap(False)
             self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(self.icon_label)
             layout.addWidget(self.text_label)
             self.collapsed_indicator.clicked.connect(self._handle_indicator_click)
-            
-        # --- 形状に応じたレイアウト調整 ---
-        if shape == "circle":
-            self.text_label.hide()
-            circle_size = int(50 * scale) 
-            self.collapsed_indicator.setFixedSize(circle_size, circle_size)
-            self.collapsed_indicator.layout().setContentsMargins(0, 0, 0, 0)
-            
-            # icon_width変数を定義せず、ここで直接設定（エラー回避のため下方の重複は消します）
-            self.icon_label.setFixedWidth(circle_size)
-            self.icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            self.is_circle_mode = True
-        else:
-            self.is_circle_mode = False
-            self.text_label.show()
-            # 他の形状は固定サイズを解除して自動計算を許可する
-            self.collapsed_indicator.setMinimumSize(0, 0)
-            self.collapsed_indicator.setMaximumSize(16777215, 16777215)
-            
-            if shape == "rect":
-                m = (int(8*scale), int(3*scale), int(10*scale), int(3*scale))
-            else:
-                m = (int(10*scale), int(5*scale), int(15*scale), int(5*scale))
-            
-            self.collapsed_indicator.layout().setContentsMargins(*m)
-            self.icon_label.setFixedWidth(int(30 * scale))
-            self.icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-
-        # 3. スタイルの更新
-        self.collapsed_indicator.set_custom_style(text_color, bg_color, shape)
-        label_style = f"color: {text_color}; font-weight: bold; font-size: {scaled_font_size}pt; background: transparent; border: none;"
-        self.icon_label.setStyleSheet(label_style)
-        self.text_label.setStyleSheet(label_style)
-        # 【修正ポイント】ここで icon_width を使っていた行を削除しました
-
-        # 4. コンテンツの代入
-        if state == 'playing':
-            icon = "♪"
-        elif state == 'paused':
-            icon = "||"
-        else:
-            icon = "❏"
-        self.icon_label.setText(icon)
-
-        raw_title = self.browser.title()
-        clean_title = re.sub(r'^\(\d+\)\s*', '', raw_title)
-        if not clean_title or clean_title == "about:blank": 
-            clean_title = "Doppel"
-        
-        max_length = 25
-        display_title = (clean_title[:max_length] + "...") if len(clean_title) > max_length else clean_title
-        self.text_label.setText(display_title)
-
-        # 5. サイズ確定と配置
-        # layout().activate() の後に adjustSize() を呼ぶことで、
-        # 隠したテキストラベルの分が正しく計算から除外されます
-        self.collapsed_indicator.layout().activate()
-        
-        if shape != "circle":
-            # circle以外は内容に合わせてリサイズ
-            self.collapsed_indicator.adjustSize()
-        
-        screen = QApplication.primaryScreen().availableGeometry()
-        x = screen.right() - self.collapsed_indicator.width() - 10
-        y = screen.bottom() - self.collapsed_indicator.height() - 10
-        self.collapsed_indicator.move(x, y)
-        self.collapsed_indicator.show()
 
     def _handle_indicator_click(self, area):
-        """インジケーターがクリックされた時の処理"""
-        # 復元処理（共通のロジックをここにまとめる）
+        """クリック時の再生制御または復元"""
         def restore_window():
-            self.show()
-            self.raise_()
-            self.activateWindow()
-            self._hide_collapsed_indicator()
+            self.show_and_activate()
 
-        # circleモードなら、どこをクリックしても復元のみ
-        if getattr(self, 'is_circle_mode', False):
+        if getattr(self, 'is_circle_mode', False) or area == "title":
             restore_window()
             return
         
-        if area == "title":
-            # 通常モード：右側（タイトル）クリックで復元
-            restore_window()
-        
-        elif area == "icon":
-            # 通常モード：左側（アイコン）クリックで再生・停止
+        if area == "icon":
             js_toggle = """
             (function() {
-                var videos = document.querySelectorAll('video');
-                var targetVideo = null;
-                var maxH = 0;
-                for (var i = 0; i < videos.length; i++) {
-                    var rect = videos[i].getBoundingClientRect();
-                    if (rect.height > maxH) {
-                        maxH = rect.height;
-                        targetVideo = videos[i];
-                    }
-                }
-                if (targetVideo) {
-                    if (targetVideo.paused) { targetVideo.play(); }
-                    else { targetVideo.pause(); }
+                var videos = Array.from(document.querySelectorAll('video'));
+                var target = videos.sort((a, b) => b.offsetHeight - a.offsetHeight)[0];
+                if (target) {
+                    if (target.paused) target.play(); else target.pause();
                     return true;
                 }
                 return false;
             })();
             """
             self.browser.page().runJavaScript(js_toggle)
-            
-            # 状態反映のために再描画
+            # クリック直後の状態を反映
             QTimer.singleShot(200, self._show_indicator)
             
-            
-            
-            
     def show_and_activate(self):
-        # 表示前にフラグを再セットすることで、OSに「現在のコンテキスト」を再認識させる
+        """小窓の復元とインジケーターの破棄"""
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.show()
         self.raise_()
         self.activateWindow()
-        # インジケーターを消す処理などがあればここに追加
-        if self.collapsed_indicator:
+        if hasattr(self, 'collapsed_indicator') and self.collapsed_indicator:
             self.collapsed_indicator.hide()
-            
+
     def toggle_indicator_mode(self):
-        if self._is_switching_mode: return # 処理中なら無視
+        """手動トグル（Alt+S等）"""
+        if getattr(self, '_is_switching_mode', False): return
         self._is_switching_mode = True
         
-        try:
-            # 既存のトグル処理
-            if self.collapsed_indicator and self.collapsed_indicator.isVisible():
-                self.collapsed_indicator.close()
-                # ここも QTimer で少し余裕を持たせる
-                QTimer.singleShot(100, self.show_and_activate)
-            else:
-                self.hide()
-                self._show_indicator()
-        finally:
-            # 0.5秒後にフラグを下ろす（重いサイト対策）
-            QTimer.singleShot(500, self._reset_transition_flag)
-
-    def _reset_transition_flag(self):
-        self._is_switching_mode = False
-            
-    def force_indicator_mode(self):
-        """Alt+W用：既にインジケーターなら何もしない、小窓なら確実にインジケーター化する"""
-        if self._is_switching_mode: return
-        
-        # すでにインジケーターが表示中なら、重複処理を避けるために何もしない
         if self.collapsed_indicator and self.collapsed_indicator.isVisible():
+            self.show_and_activate()
+        else:
+            self.hide()
+            self._show_indicator()
+            
+        QTimer.singleShot(500, lambda: setattr(self, '_is_switching_mode', False))
+
+    def force_indicator_mode(self):
+        """Alt+W用：確実にインジケーター化"""
+        if getattr(self, '_is_switching_mode', False): return
+        if not self.isVisible() and self.collapsed_indicator and self.collapsed_indicator.isVisible():
             return
 
         self._is_switching_mode = True
-        try:
-            # 小窓を隠してインジケーターを表示
-            self.hide()
-            self._show_indicator()
-        finally:
-            # 0.5秒後にフラグをリセット（連打防止）
-            QTimer.singleShot(500, self._reset_transition_flag)
-
-    def _hide_collapsed_indicator(self):
-        if self.collapsed_indicator:
-            self.collapsed_indicator.hide()
+        self.hide()
+        self._show_indicator()
+        QTimer.singleShot(500, lambda: setattr(self, '_is_switching_mode', False))
 
     def collapse_to_indicator(self):
-        """小窓を閉じたら、必ずインジケーターとして格納する"""
+        """小窓閉鎖時の自動格納"""
         self.hide()
         self._show_indicator()
         

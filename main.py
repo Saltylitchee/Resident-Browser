@@ -409,6 +409,32 @@ class ClickableLabel(QLabel):
             self.clicked.emit("title")
             
 class ResidentMiniPlayer(QMainWindow):
+    # --- 設定値へのアクセスをプロパティ化 ---
+    @property
+    def app_settings(self):
+        """アプリ全体の共通設定を取得"""
+        return self.config_manager.data.get("app_settings", {})
+
+    @property
+    def current_preset(self):
+        """現在アクティブなプリセットデータを直接返す"""
+        try:
+            data = self.config_manager.data
+            idx = self.app_settings.get("last_active_preset_index", 0)
+            return data["presets"][idx]
+        except (IndexError, KeyError):
+            return {}
+
+    @property
+    def layout_threshold(self):
+        """デスクトップ/モバイルを判定する閾値"""
+        return self.app_settings.get("layout_threshold", 600)
+
+    @property
+    def desktop_zoom_default(self):
+        """デスクトップモード時の固定ズーム率"""
+        return self.app_settings.get("desktop_zoom_default", 0.8)
+    
     def __init__(self, config_manager, selector_manager):
         super().__init__()
         # --- 1. すべてのインスタンス変数を「最初」に初期化する ---
@@ -692,7 +718,6 @@ class ResidentMiniPlayer(QMainWindow):
         self.profile = QWebEngineProfile("PortalResidentStorage", self)
         self.profile.setPersistentStoragePath(PROFILE_DIR)
 
-        self.layout_threshold = 800
         self.ua_desktop = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         self.profile.setHttpUserAgent(self.ua_desktop)
         
@@ -1182,37 +1207,26 @@ class ResidentMiniPlayer(QMainWindow):
         self._display_preset_notification("★New Size Pattern Locked & Added!")
         
     def adjust_zoom(self, force_desktop=False):
-        """現在のウィンドウ幅に基づき、プリセットごとの基準幅(base_width)に合わせてズームを調整"""
-        # 初期化前や設定マネージャーがない場合はスキップ
+        """現在のウィンドウ幅に基づきズームを調整"""
         if not hasattr(self, 'config_manager') or self.config_manager is None:
             return
+        # デスクトップ版：設定値から固定ズームを適用
         if force_desktop:
-            # デスクトップ版を維持するための「魔法の数字」
-            # 0.8以下にすると、多くのサイトは「十分な幅がある」と誤認してくれます
-            self.browser.setZoomFactor(0.8)
+            self.browser.setZoomFactor(self.desktop_zoom_default)
             return
-        
+        # モバイル版：base_widthに基づき動的に計算
         new_width = self.width()
-        # 前回の幅と同じなら処理しない（無駄な計算を回避）
         if hasattr(self, '_last_zoom_width') and self._last_zoom_width == new_width:
             return
         try:
-            # 1. JSONから現在のプリセット情報を取得
-            data = self.config_manager.data
-            idx = data["app_settings"].get("last_active_preset_index", 0)
-            preset = data["presets"][idx]
-            # 2. 基準幅(base_width)を取得（未設定なら400pxをデフォルトに）
-            base_width = preset.get("base_width", 400)
-            # 3. ズーム倍率を計算
+            # プロパティ current_preset を使ってスッキリ記述
+            base_width = self.current_preset.get("base_width", 400)
             zoom_level = new_width / base_width
-            # 極端な数値にならないよう制限（0.4倍〜2.0倍）
             zoom_level = max(0.4, min(zoom_level, 2.0))
-            # 4. ブラウザに適用
             self.browser.setZoomFactor(zoom_level)
             self._last_zoom_width = new_width
-        except (IndexError, KeyError, ZeroDivisionError) as e:
-            # 基準幅が0だった場合などのエラー回避
-            print(f"Zoom adjustment failed: {e}")
+        except ZeroDivisionError:
+            pass
         
     def cycle_geometry(self):
         """Alt + D: 現在のプリセット内で locations を巡回する"""
@@ -1316,14 +1330,16 @@ class ResidentMiniPlayer(QMainWindow):
         self._update_geometry_if_unlocked()
 
     def resizeEvent(self, event):
+        """ウィンドウサイズ変更時の統合ハンドラ"""
         super().resizeEvent(event)
+        # 1. 座標の更新
         self._update_geometry_if_unlocked()
-        # 1. 閾値でモードを決定
+        # 2. 表示モードの判定（プロパティを使用）
         is_desktop = self.width() > self.layout_threshold
         target_mode = "desktop" if is_desktop else "mobile"
-        # 2. ViewportやYouTube固有のフラグをセット
+        # 3. Viewport/YouTubeフラグの適用
         self.set_view_mode(target_mode)
-        # 3. ズーム調整。デスクトップ版なら「固定」、モバイルなら「動的」に切り替える
+        # 4. ズームの最終調整
         self.adjust_zoom(force_desktop=is_desktop)
         
     def closeEvent(self, event):

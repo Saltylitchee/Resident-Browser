@@ -417,15 +417,12 @@ class ResidentMiniPlayer(QMainWindow):
     
     @property
     def reserved_shortcut_keys(self):
-        """
-        設定されているショートカットキー（Qt.Key）のセットを返す。
-        一度計算したらキャッシュし、設定変更時のみ再計算する。
-        """
+        """キャッシュされたキーセットを返す（_is_reserved_shortcut は削除してOK）"""
         if hasattr(self, "_shortcut_cache"):
             return self._shortcut_cache
 
         shortcuts = self.app_settings.get("shortcuts", {})
-        self._shortcut_cache = set() # 検索が高速な set を使用
+        self._shortcut_cache = set()
         for action_name, key_char in shortcuts.items():
             if action_name == "modifier": continue
             target_key = getattr(Qt.Key, f"Key_{key_char.upper()}", None)
@@ -527,66 +524,87 @@ class ResidentMiniPlayer(QMainWindow):
         self.browser.loadFinished.connect(self._on_load_finished)
         # --- 5. URLのロード ---
         def start_initial_load():
-            # 1. 現在のウィンドウ幅に応じて、UAとズームの「初期値」を決定
-            # （※適用直後のサイズで判定するため、ここで一度計算する）
+            # 1. 広告のチラ見えを防ぐ（先に真っ白にしておく）
+            self.browser.setHtml("<html><body style='background:white;'></body></html>")
+            # 2. 強制的にフォーカスを「ブラウザ以外」に一度移す
+            # これにより eventFilter が最初から有効になるように促す
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
+            # 3. UA・ズーム判定（既存ロジック）
             if self.width() > self.layout_threshold:
                 self._set_desktop_cookie_directly()
                 self.browser.setZoomFactor(self.desktop_zoom_default)
-                self.profile.setHttpUserAgent(self.ua_desktop)
             else:
                 self.browser.setZoomFactor(self.mobile_zoom_default)
-            # 2. プロパティからURLを取得（cc_load_policyの付与ロジック）
+            # 4. URLロード
             last_url = self.current_preset.get("last_url")
             self.browser.setUrl(self._get_clean_url(last_url))
-        # 直接呼び出すのではなく、タイマーで一瞬だけ遅らせる
-        # これにより、Geometry（サイズ）が確実にOS側で適用された後にリクエストが飛ぶ
-        QTimer.singleShot(50, start_initial_load)
+        QTimer.singleShot(150, start_initial_load) # 余裕を持って150ms
         # セレクターのロード
         self.load_selectors()
         self.reload_shortcut = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
         self.reload_shortcut.activated.connect(self.reload_and_apply)
+        self.current_mode = DisplayMode.EXPANDED # 明示的に初期化
+        self._is_switching_mode = False
         
     def handle_show_request(self):
         """
-        Alt+S（表示リクエスト）に対する意思決定。
-        何を表示するか、どのモードにするかはクラス自身が判断する。
+        Alt+S：OSの状態（isHidden）を信じず、
+        『インジケーターが出ているか、あるいは窓が変数上で展開中以外か』で判定する
         """
-        if not self.has_valid_content():
-            self._display_preset_notification("No URL to show. Press Alt+C.")
-            return
+        if not self.has_valid_content(): return
 
-        # モードのトグル
-        target = (DisplayMode.EXPANDED 
-                if self.current_mode != DisplayMode.EXPANDED 
-                else DisplayMode.COLLAPSED)
-        self.update_display_mode(target)
+        # インジケーターが表示されているか、あるいは現在のモードが EXPANDED 以外なら「展開」
+        indicator_visible = self.collapsed_indicator and self.collapsed_indicator.isVisible()
+        
+        if indicator_visible or self.current_mode != DisplayMode.EXPANDED:
+            self.update_display_mode(DisplayMode.EXPANDED)
+        else:
+            # それ以外（窓が展開されているはず）なら「格納」
+            self.update_display_mode(DisplayMode.COLLAPSED)
         
     def update_display_mode(self, target_mode: DisplayMode):
-        if self._is_switching_mode: return
+        if getattr(self, '_is_switching_mode', False): return
         self._is_switching_mode = True
 
         try:
-            # 1. 既存表示のクリーンアップ
-            if self.collapsed_indicator:
-                self.collapsed_indicator.hide()
+            if target_mode in [DisplayMode.COLLAPSED, DisplayMode.HIDDEN]:
+                # --- [解決] 1回目の空振りを防ぐための「フォーカス・リリース」 ---
+                # 自分のフォーカスを外してから隠すことで、OSの拒絶を回避する
+                self.clearFocus()
+                if self.browser:
+                    self.browser.clearFocus()
+                
+                # 最前面フラグを剥がす
+                self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowStaysOnTopHint)
+                
+                # [重要] show()を呼んでフラグ変更を確定させてから即hide()
+                self.show() 
+                self.hide()
+                
+                self.current_mode = target_mode
+                
+                if target_mode == DisplayMode.COLLAPSED:
+                    # 前回の修正通り、少し遅延させてインジケーターを出す
+                    QTimer.singleShot(50, self._show_indicator)
+                else:
+                    self._display_preset_notification("★Stealth Mode Activated")
 
-            # 2. ターゲットモードへの遷移
-            if target_mode == DisplayMode.EXPANDED:
-                self.show_and_activate()
+            elif target_mode == DisplayMode.EXPANDED:
+                if self.collapsed_indicator:
+                    self.collapsed_indicator.hide()
+                
+                # 展開時はフラグを戻して表示
+                self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+                self.show()
+                self.activateWindow()
+                self.raise_()
                 self.current_mode = DisplayMode.EXPANDED
 
-            elif target_mode == DisplayMode.COLLAPSED:
-                self.hide()
-                self._show_indicator()
-                self.current_mode = DisplayMode.COLLAPSED
-
-            elif target_mode == DisplayMode.HIDDEN:
-                self.hide()
-                self.current_mode = DisplayMode.HIDDEN
-                self._display_preset_notification("★Stealth Mode Activated") # 潜伏したことを通知
+            QApplication.processEvents()
 
         finally:
-            QTimer.singleShot(500, self._reset_transition_flag)
+            # フラグのリセット（間隔を少し短くしてレスポンス向上）
+            QTimer.singleShot(150, self._reset_transition_flag)
             
     def has_valid_content(self):
         """
@@ -777,6 +795,7 @@ class ResidentMiniPlayer(QMainWindow):
         self.browser.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.browser.installEventFilter(self)
         self.page.loadFinished.connect(self._install_proxy_filter)
+        self.browser.hide()
         
     def apply_site_optimizations(self):
         """
@@ -831,6 +850,7 @@ class ResidentMiniPlayer(QMainWindow):
         # 4. 特定ドメインの追加調整（デスクトップレイアウト強制など）
         if "youtube.com" in url:
             self._force_desktop_layout()
+        QTimer.singleShot(150, self.browser.show)
             
     def load_selectors(self):
         """外部設定ファイルを読み込み、メモリ上の変数に格納する"""
@@ -1092,65 +1112,25 @@ class ResidentMiniPlayer(QMainWindow):
         # 検索実行
         self.browser.findText(text, flags, self._update_hit_count)
 
-    def _is_reserved_shortcut(self, key):
-        """押されたキーが設定済みのショートカットかどうかを判定する"""
-        shortcuts = self.app_settings.get("shortcuts", {})
-        # 文字列をQtKeyに変換する処理を効率化（例：1回だけ変換して使い回すのが理想）
-        for key_char in shortcuts.values():
-            if isinstance(key_char, str):
-                target_key = getattr(Qt.Key, f"Key_{key_char.upper()}", None)
-                if key == target_key:
-                    return True
-        return False
-
     def eventFilter(self, obj, event):
         if event.type() != QEvent.Type.KeyPress:
             return super().eventFilter(obj, event)
 
         key = event.key()
         modifiers = event.modifiers()
-        is_alt = modifiers & Qt.KeyboardModifier.AltModifier
-        is_ctrl = modifiers & Qt.KeyboardModifier.ControlModifier
+        is_alt = bool(modifiers & Qt.KeyboardModifier.AltModifier)
 
-        # --- 1. Control系 (固定) ---
-        if is_ctrl:
-            if key == Qt.Key.Key_F:
-                self.toggle_search_container()
-                return True
-            if key == Qt.Key.Key_R:
-                self.browser.reload()
-                return True
-
-        # --- 2. Alt系 (動的・プリセット) ---
+        # [解決] Alt+Wが効かない原因：ブロックするだけで何もしていなかった
+        # ここで直接メソッドを呼ぶことで、フォーカスがあっても即座に反応させる
         if is_alt:
-            # A. ブラウザナビゲーション
-            if key == Qt.Key.Key_Left:
-                self.browser.back()
-                return True
-            if key == Qt.Key.Key_Right:
-                self.browser.forward()
-                return True
+            shortcuts = self.app_settings.get("shortcuts", {})
+            key_char = chr(key).lower() if 32 <= key <= 126 else ""
 
-            # B. 数字キーショートカット (有効時のみ)
-            # 設定値（例: enable_number_shortcuts）が True の場合のみ判定
-            if self.app_settings.get("enable_number_shortcuts", True):
-                if Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
-                    # ここでプリセット切り替えロジックを呼ぶ
-                    self._switch_preset_by_index(key - Qt.Key.Key_1) 
-                    return True
-
-            # C. その他の動的ショートカットのブロック
-            # キャッシュ済みのセットを使うので、ループを回す必要がなく高速
-            if key in self.reserved_shortcut_keys:
+            if key_char == shortcuts.get("show_toggle", "s"):
+                self.handle_show_request()
                 return True
-
-        # --- 3. ウィジェット個別処理 (検索バーなど) ---
-        if obj == self.search_bar:
-            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                self._handle_search_enter()
-                return True
-            if key == Qt.Key.Key_Escape:
-                self.toggle_search_container()
+            if key_char == shortcuts.get("hide_completely", "w"):
+                self.update_display_mode(DisplayMode.HIDDEN)
                 return True
 
         return super().eventFilter(obj, event)
@@ -1366,8 +1346,13 @@ class ResidentMiniPlayer(QMainWindow):
         self.adjust_zoom(force_desktop=is_desktop)
         
     def closeEvent(self, event):
-        # 終了時にURLと最新座標をまとめてファイル保存
-        self.save_current_state()
+        """ウィンドウが閉じられるとき（Ctrl+C含む）のクリーンアップ"""
+        # keyboardのフックを外す（これが終了を遅らせる主犯です）
+        try:
+            import keyboard
+            keyboard.unhook_all()
+        except:
+            pass
         super().closeEvent(event)
         
     def set_view_mode(self, mode="desktop"):
@@ -1422,9 +1407,7 @@ class ResidentMiniPlayer(QMainWindow):
         """
         self.browser.page().runJavaScript(js_code, self._update_indicator_with_state)
 
-    # --- エラー修正用：フラグリセットメソッド ---
     def _reset_transition_flag(self):
-        """トグル処理中のロックを解除する"""
         self._is_switching_mode = False
 
     # --- インジケーター更新の司令塔 ---
@@ -1608,30 +1591,6 @@ class ResidentMiniPlayer(QMainWindow):
         if hasattr(self, 'collapsed_indicator') and self.collapsed_indicator:
             self.collapsed_indicator.hide()
 
-    def toggle_indicator_mode(self):
-        """手動トグル（Alt+S等）"""
-        if getattr(self, '_is_switching_mode', False): return
-        self._is_switching_mode = True
-        
-        if self.collapsed_indicator and self.collapsed_indicator.isVisible():
-            self.show_and_activate()
-        else:
-            self.hide()
-            self._show_indicator()
-            
-        QTimer.singleShot(500, lambda: setattr(self, '_is_switching_mode', False))
-
-    def force_indicator_mode(self):
-        """Alt+W用：確実にインジケーター化"""
-        if getattr(self, '_is_switching_mode', False): return
-        if not self.isVisible() and self.collapsed_indicator and self.collapsed_indicator.isVisible():
-            return
-
-        self._is_switching_mode = True
-        self.hide()
-        self._show_indicator()
-        QTimer.singleShot(500, lambda: setattr(self, '_is_switching_mode', False))
-
     def collapse_to_indicator(self):
         """小窓閉鎖時の自動格納"""
         self.hide()
@@ -1703,41 +1662,43 @@ last_action_time = 0
 def check_hotkeys():
     global last_action_time
     now = time.time()
-    if now - last_action_time < 0.3:
+    if now - last_action_time < 0.25: # チャタリング防止
         return
-    # 1. 設定からショートカットキー設定を読み込む（存在しなければデフォルト値を設定）
-    # main_window (ResidentMiniPlayer) を経由して config_manager にアクセス
+
+    if current_window is None:
+        return
+
     shortcuts = current_window.config_manager.data["app_settings"].get("shortcuts", {})
     modifier = shortcuts.get("modifier", "alt")
-    # モディファイアキー（Altなど）が押されていなければ終了
+    
     if not keyboard.is_pressed(modifier):
         return
+
     is_shift = keyboard.is_pressed('shift')
-    # 2. 機能キーとのマッピング表
-    # キー名 : 発火させるシグナル
+
     mapping = {
         shortcuts.get("hide_completely", "w"): bridge.hide_completely_requested,
         shortcuts.get("show_toggle", "s"):      bridge.show_requested,
         shortcuts.get("copy", "c"):             bridge.copy_requested,
         shortcuts.get("paste", "v"):            bridge.paste_requested,
-        shortcuts.get("cycle_size", "d"):       bridge.cycle_geometry_requested # 名称変更を反映
+        shortcuts.get("cycle_size", "d"):       bridge.cycle_geometry_requested
     }
-    # 3. マッピングに基づいた判定
+
+    # 1. 機能キー
     for key, signal in mapping.items():
         if keyboard.is_pressed(key):
-            # Shiftが必要なキーとそうでないキーの干渉を防ぐガード
-            if key in ['s', 'd'] and is_shift:
-                continue
+            if key in ['s', 'd'] and is_shift: continue
             signal.emit()
             last_action_time = now
-            return # 1つのキーが判定されたら終了
-    # 4. 数字キー 1~9 の動的スキャン（プリセット切り替え）
-    for i in range(1, 10):
-        if keyboard.is_pressed(str(i)):
-            # Bridgeに新設した preset_switch_requested を使用 (0始まりにするため i-1)
-            bridge.preset_switch_requested.emit(i - 1)
-            last_action_time = now
             return
+
+    # 2. 数字キー（current_window を経由）
+    if current_window.app_settings.get("enable_number_shortcuts", True):
+        for i in range(1, 10):
+            if keyboard.is_pressed(str(i)):
+                bridge.preset_switch_requested.emit(i - 1)
+                last_action_time = now
+                return
 
 def main():
     app = QApplication(sys.argv)
@@ -1758,25 +1719,34 @@ def main():
     # --- 2. Windowを作成 ---
     # インスタンス化したマネージャーたちを渡す
     main_window = ResidentMiniPlayer(config_manager, selector_manager)
+    # 1. current_windowを先に確定させる（check_hotkeysエラー防止）
     global current_window
     current_window = main_window
-    # --- 3. シグナルの配線 ---
+
+    # 2. シグナル接続を一本化
+    bridge.show_requested.connect(main_window.handle_show_request)
+    # [解決] メソッドを直接呼ぶようにしてHIDDENを処理させる
+    bridge.hide_completely_requested.connect(
+        lambda: main_window.update_display_mode(DisplayMode.HIDDEN)
+    )
+    
+    # 他の接続...
     bridge.copy_requested.connect(main_window.capture_current_url)
     bridge.paste_requested.connect(main_window.apply_url_from_dispatch)
     bridge.cycle_geometry_requested.connect(main_window.cycle_geometry)
     bridge.preset_switch_requested.connect(main_window.apply_preset)
-    bridge.show_requested.connect(main_window.handle_show_request)
-    bridge.hide_completely_requested.connect(
-        lambda: main_window.update_display_mode(DisplayMode.HIDDEN)
-    )
-    # --- 4. システム・監視系 ---
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    monitor_timer = QTimer()
-    monitor_timer.setParent(main_window) 
+
+    # 3. タイマー開始
+    monitor_timer = QTimer(main_window)
     monitor_timer.timeout.connect(check_hotkeys)
-    monitor_timer.start(50)
-    print("Watching Alt+C/V/D/S... (Press Ctrl+C to stop)")
+    monitor_timer.start(100)
+
+    # 4. 最後に表示
     main_window.show()
+    # 起動時のモードを明示的にセットし、1回目のAlt+Sが「隠す」から始まるようにする
+    main_window.current_mode = DisplayMode.EXPANDED 
+    QApplication.processEvents() 
+    
     sys.exit(app.exec())
 
 if __name__ == "__main__":

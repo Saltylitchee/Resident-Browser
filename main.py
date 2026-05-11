@@ -521,8 +521,8 @@ class ResidentMiniPlayer(QMainWindow):
         # --- 4. シグナルの接続 ---
         self.browser.page().recentlyAudibleChanged.connect(self._handle_audio_status)
         self.browser.titleChanged.connect(self._on_title_changed)
-        self.browser.loadFinished.connect(self.inject_adblock)
-        self.browser.urlChanged.connect(lambda: self.inject_adblock()) 
+        self.browser.loadFinished.connect(self.apply_site_optimizations)
+        self.browser.urlChanged.connect(lambda: self.apply_site_optimizations())
         self.browser.loadFinished.connect(self.adjust_zoom)
         self.browser.loadFinished.connect(self._on_load_finished)
         # --- 5. URLのロード ---
@@ -778,78 +778,59 @@ class ResidentMiniPlayer(QMainWindow):
         self.browser.installEventFilter(self)
         self.page.loadFinished.connect(self._install_proxy_filter)
         
-    def inject_adblock(self):
-        current_url = self.browser.url().host()
+    def apply_site_optimizations(self):
+        """
+        SelectorManagerを使用して、サイト固有のCSS注入・要素隠蔽・レイアウト調整を
+        一括で実行する。
+        """
+        url = self.browser.url().toString()
+        if not url or url == "about:blank":
+            return
         
-        # --- 1. 設定ファイルの読み込みと検証 ---
-        try:
-            # 実行ファイルからの絶対パスを取得（Windows環境での安定性向上）
-            base_path = os.path.dirname(os.path.abspath(__file__))
-            json_path = os.path.join(base_path, "selectors.json")
-
-            if not os.path.exists(json_path):
-                # ファイルがない場合はログを出して早期リターン
-                print(f"WARNING: '{json_path}' not found. Skipping injection.")
-                return
-
-            with open(json_path, "r", encoding="utf-8") as f:
-                all_selectors = json.load(f)
-                
-        except json.JSONDecodeError as e:
-            # JSONの書き方が間違っている場合
-            print(f"ERROR: Failed to parse 'selectors.json'. Line {e.lineno}, Col {e.colno}: {e.msg}")
+        # 1. データの取得（SelectorManagerに一任）
+        data = self.selector_manager.get_data_for_url(url)
+        if not data:
             return
-        except Exception:
-            # その他の予期せぬエラー（権限エラーなど）
-            print("ERROR: Unexpected error while loading selectors.json")
-            print(traceback.format_exc()) # エラーの詳細（スタックトレース）を出力
-            return
+        css = data.get("injected_css", "")
+        hide_selectors = data.get("hide_elements", [])
+        # 2. JSコードの構築
+        # f-string内での波括弧は二重 {{ }} でエスケープ
+        js_code = f"""
+        (function() {{
+            // A. CSSの注入
+            const styleId = 'resident-optimized-style';
+            let style = document.getElementById(styleId);
+            if (!style) {{
+                style = document.createElement('style');
+                style.id = styleId;
+                (document.head || document.documentElement).appendChild(style);
+            }}
+            style.textContent = `{css}`;
 
-        # --- 2. ドメイン設定の取得 ---
-        # ドメインの部分一致（youtube.comなど）を確認
-        site_config = next((config for domain, config in all_selectors.items() if domain in current_url), None)
-        
-        if not site_config:
-            # 設定がないドメインはエラーではなく、単に何もしないのが「汎用型」として正しい挙動
-            return
+            // B. 要素隠蔽（動的監視）
+            const hideElements = () => {{
+                const selectors = {json.dumps(hide_selectors)};
+                selectors.forEach(s => {{
+                    document.querySelectorAll(s).forEach(el => {{
+                        if (el.style.display !== 'none') {{
+                            el.style.display = 'none';
+                        }}
+                    }});
+                }});
+            }};
 
-        # --- 3. JS注入（置換処理） ---
-        try:
-            js_template = """
-            (function() {
-                const run = () => {
-                    const targets = __REMOVE_LIST__;
-                    targets.forEach(s => {
-                        const el = document.querySelector(s);
-                        if (el) el.style.display = 'none';
-                    });
-
-                    const styleId = 'resident-shield-v4';
-                    let styleTag = document.getElementById(styleId);
-                    if (!styleTag) {
-                        styleTag = document.createElement('style');
-                        styleTag.id = styleId;
-                        (document.head || document.documentElement).appendChild(styleTag);
-                    }
-                    styleTag.textContent = "__CSS_CONTENT__";
-                };
-                run();
-                setTimeout(run, 1000);
-                setTimeout(run, 3000);
-            })();
-            """
-
-            # 必要な値が site_config に含まれているかチェック
-            remove_list = json.dumps(site_config.get("remove", []))
-            css_content = site_config.get("css", "")
-
-            final_js = js_template.replace("__REMOVE_LIST__", remove_list)
-            final_js = final_js.replace("__CSS_CONTENT__", css_content)
-
-            self.browser.page().runJavaScript(final_js)
-            
-        except Exception as e:
-            print(f"ERROR: Script injection failed for {current_url}: {e}")
+            // 初回実行と監視の開始
+            hideElements();
+            if (window.residentObserver) window.residentObserver.disconnect();
+            window.residentObserver = new MutationObserver(hideElements);
+            window.residentObserver.observe(document.body, {{ childList: true, subtree: true }});
+        }})();
+        """
+        # 3. 実行
+        self.browser.page().runJavaScript(js_code)
+        # 4. 特定ドメインの追加調整（デスクトップレイアウト強制など）
+        if "youtube.com" in url:
+            self._force_desktop_layout()
             
     def load_selectors(self):
         """外部設定ファイルを読み込み、メモリ上の変数に格納する"""
@@ -871,7 +852,7 @@ class ResidentMiniPlayer(QMainWindow):
         """設定を読み直して、現在のページに即適用する"""
         if self.load_selectors():
             # 読み込みに成功したら、現在のページに最新設定を注入
-            self.inject_adblock()
+            self.apply_site_optimizations()
             # ユーザーに知らせる（ステータスバーがある場合）
             self.statusBar().showMessage("Settings reloaded and applied!", 3000)
 
@@ -883,63 +864,53 @@ class ResidentMiniPlayer(QMainWindow):
         self._force_desktop_layout()
 
     def _force_desktop_layout(self):
-        if not hasattr(self, 'page') or self.page is None or self.width() <= self.layout_threshold:
+        if not hasattr(self, 'page') or self.page is None:
             return
 
         script = """
         (function() {
-            // 1. YouTubeのモバイル専用要素を隠す
-            var m_web = document.getElementsByTagName('ytm-app')[0];
-            if (m_web) { m_web.style.display = 'none'; }
+            // 1. YouTubeのモバイル専用UI要素を隠蔽
+            const mWeb = document.getElementsByTagName('ytm-app')[0];
+            if (mWeb) { mWeb.style.display = 'none'; }
 
-            // 2. Cookieの再セット（デスクトップ設定の維持）
+            // 2. デスクトップ版設定を維持するためのCookie
             try {
                 document.cookie = "PREF=f6=40000; domain=.youtube.com; path=/";
             } catch (e) {
-                console.warn("Cookie injection blocked by browser security.");
+                console.warn("Cookie injection failed:", e);
             }
             
-            // 3. YouTubeの内部フラグ書き換え
+            // 3. YouTubeの内部フラグ（モバイル版挙動）を無効化
             if (window.yt && window.yt.config_) {
-                window.yt.config_.EXPERIMENT_FLAGS.kevlar_is_mweb_modern_f_and_e_interaction = false;
+                if (window.yt.config_.EXPERIMENT_FLAGS) {
+                    window.yt.config_.EXPERIMENT_FLAGS.kevlar_is_mweb_modern_f_and_e_interaction = false;
+                }
             }
             
-            var target = document.getElementsByTagName('head')[0] || document.documentElement;
-            if (target) {
-                target.appendChild(newMeta);
+            // 4. Viewportの強制上書き（PC版の解像度に見せかける）
+            let meta = document.querySelector('meta[name="viewport"]');
+            if (!meta) {
+                meta = document.createElement('meta');
+                meta.name = "viewport";
+                (document.head || document.documentElement).appendChild(meta);
             }
-            
-            // 4. ViewportをPCサイズで固定
-            var meta = document.querySelector('meta[name="viewport"]');
-            if (meta) { 
-                meta.setAttribute('content', 'width=1280, initial-scale=1.0');
-            } else {
-                var newMeta = document.createElement('meta');
-                newMeta.name = "viewport";
-                newMeta.content = "width=1280";
-                document.getElementsByTagName('head')[0].appendChild(newMeta);
-            }
+            meta.setAttribute('content', 'width=1280, initial-scale=1.0');
 
-            // 5. 字幕（CC）を強制オフにするロジック
-            var disableSubtitles = function() {
-                // YouTubeプレーヤーの字幕ボタンを取得
-                var ccButton = document.querySelector('.ytp-subtitles-button');
-                // ボタンが存在し、かつ「押されている（オン）」状態ならクリックしてオフにする
+            // 5. 字幕（CC）の自動オフ
+            const disableSubtitles = () => {
+                const ccButton = document.querySelector('.ytp-subtitles-button');
                 if (ccButton && ccButton.getAttribute('aria-pressed') === 'true') {
                     ccButton.click();
-                    console.log("Subtitles disabled by ResidentBrowser");
                 }
             };
-
-            // 即時実行と、要素のレンダリング待ちを考慮した遅延実行（1秒後）
             disableSubtitles();
-            setTimeout(disableSubtitles, 1000);
+            setTimeout(disableSubtitles, 1500); // 描画遅延を考慮
 
-            // 6. YouTubeに「画面サイズが変わったぞ」と叫ぶ
+            // 6. レイアウト再計算のトリガー
             window.dispatchEvent(new Event('resize'));
         })();
         """
-        self.page.runJavaScript(script)
+        self.browser.page().runJavaScript(script)
 
     def _setup_ui(self):
         # --- 1. 状態の初期化 ---
@@ -1458,32 +1429,32 @@ class ResidentMiniPlayer(QMainWindow):
 
     # --- インジケーター更新の司令塔 ---
     def _update_indicator_with_state(self, state):
-        """【最適化版司令塔】状態変化に応じて、更新の範囲を最小限に抑える"""
-        # 状態の正規化
+        """【最新版司令塔】状態を正規化し、自律的な各担当メソッドへ処理を委譲する"""
+        # 1. 状態の正規化（playing / paused / stopped）
         state = state if state in ('playing', 'paused') else 'stopped'
-        # プロパティからスマートに取得
-        styles = self.current_preset.get("indicator_styles", {})
+        # 2. インジケーターの存在確認とスケール反映（ここは初期化として維持）
         scale = self.app_settings.get("global_indicator_scale", 1.0)
-        shape = styles.get("shape", "rounded_rect")
         self._ensure_indicator_exists(scale)
-        # 現在のタイトルを取得（一度変数に入れて使い回す）
+        # 3. 最適化：タイトルと状態が前回と同じなら、重い更新をスキップ
         current_raw_title = self.browser.title()
         is_visible = self.collapsed_indicator.isVisible()
         last_title = getattr(self, '_last_processed_title', None)
-        # --- 最適化：タイトル不変なら最小限の更新 ---
-        if is_visible and last_title == current_raw_title:
-            icon = {"playing": "♪", "paused": "||"}.get(state, "❏")
-            self.icon_label.setText(icon)
-            return 
-        # --- フル更新が必要な場合 ---
+        last_state = getattr(self, '_last_processed_state', None)
+        if is_visible and last_title == current_raw_title and last_state == state:
+            return
+        # --- フル更新の開始 ---
         self._last_processed_title = current_raw_title
+        self._last_processed_state = state
+        # 描画のチラつきを抑える
         self.collapsed_indicator.setUpdatesEnabled(False)
         try:
-            self._apply_indicator_style(styles, scale)
-            self._set_indicator_content(state, styles)
-            self._finalize_indicator_geometry(shape, scale)
+            # 【ここを修正】引数を渡さず、メソッド自身の自律性に任せる
+            self._apply_indicator_style()       # 担当1：見た目
+            self._set_indicator_content(state)  # 担当2：中身（状態だけは渡す）
+            self._finalize_indicator_geometry() # 担当3：配置
         finally:
             self.collapsed_indicator.setUpdatesEnabled(True)
+        # 4. 表示状態の管理
         if not is_visible:
             self.collapsed_indicator.show()
         self.collapsed_indicator.raise_()
@@ -1665,73 +1636,19 @@ class ResidentMiniPlayer(QMainWindow):
         """小窓閉鎖時の自動格納"""
         self.hide()
         self._show_indicator()
-        
-    def _apply_site_customizations(self):
-        """CSS注入と監視のみを実行（ボタン操作なし）"""
-        url = self.browser.url().toString()
-        data = self.selector_manager.get_data_for_url(url)
-        if not data:
-            return
-
-        css = data.get("injected_css", "")
-        hide_selectors = data.get("hide_elements", [])
-
-        js_code = f"""
-        (function() {{
-            // 1. CSS注入（一度だけ実行）
-            const styleId = 'resident-shield';
-            let style = document.getElementById(styleId);
-            if (!style) {{
-                style = document.createElement('style');
-                style.id = styleId;
-                (document.head || document.documentElement).appendChild(style);
-            }}
-            style.textContent = `{css}`;
-
-            // 2. 要素隠蔽の関数
-            const hideElements = () => {{
-                const selectors = {json.dumps(hide_selectors)};
-                selectors.forEach(s => {{
-                    document.querySelectorAll(s).forEach(el => {{
-                        if (el.style.display !== 'none') el.style.display = 'none';
-                    }});
-                }});
-            }};
-
-            // 初回実行
-            hideElements();
-
-            // 3. 監視開始（広告やサイドバーが復活したら消す）
-            if (window.residentObserver) window.residentObserver.disconnect();
-            window.residentObserver = new MutationObserver(hideElements);
-            window.residentObserver.observe(document.body, {{ childList: true, subtree: true }});
-        }})();
-        """
-        self.browser.page().runJavaScript(js_code)
-        
-    def apply_site_settings(self, current_url):
-        # SelectorManager に丸投げ！
-        site_data = self.selector_manager.get_data_for_url(current_url)
-
-        if site_data:
-            css = site_data.get("css", "")
-            js = site_data.get("js", "")
-            # ここでCSSとJSを適用する処理へ...
-        else:
-            print("No specific settings for this domain.")
 
     def _on_load_finished(self, ok):
         """ページ読み込み完了時に実行"""
         if ok:
             # 1. サイト固有のカスタマイズ（広告ブロック等）を適用
-            self._apply_site_customizations()
+            self.apply_site_optimizations()
             
             # 2. 横長の場合、再度デスクトップ化を強制
             if self.width() > self.layout_threshold:
                 self._force_desktop_layout()
                 
             # 3. 1秒後にもう一度ダメ押し（動的な要素の読み込み待ち）
-            QTimer.singleShot(1000, self._apply_site_customizations)
+            QTimer.singleShot(1000, self.apply_site_optimizations)
             if self.width() > self.layout_threshold:
                 QTimer.singleShot(1500, self._force_desktop_layout)
 

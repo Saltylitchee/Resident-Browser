@@ -1,5 +1,6 @@
 {
     "youtube.com": {
+        "force_desktop": true,
         "hide_elements": [
             "#chat", "#chat-container", "ytd-live-chat-frame",
             "ytd-live-chat-renderer", ".ad-container",
@@ -11,6 +12,7 @@
         "action_selectors": {}
     },
     "twitch.tv": {
+        "force_desktop": false,
         "hide_elements": [ ".video-ads", ".chat-room" ],
         "injected_css": "...",
         "action_selectors": {

@@ -1,11 +1,9 @@
 import sys
-import signal
 import os
 import re
 import json
 import time
 import keyboard
-import traceback
 import shutil
 import requests
 from datetime import datetime
@@ -182,7 +180,6 @@ class SelectorManager:
                     return new_data
             except Exception as e:
                 print(f"[SelectorManager] Remote sync failed: {e}. Using local cache.")
-        
         return self._load_local_file()
 
     def _load_local_file(self):
@@ -202,21 +199,27 @@ class SelectorManager:
             print(f"[SelectorManager] Failed to save cache: {e}")
 
     def get_data_for_url(self, url):
-        """URLからドメインを抽出し、正確にマッチングさせる"""
-        if not self.selectors:
-            return None
-        # URLから純粋なホスト名（例: www.youtube.com）を取得
+        """URLからドメインを抽出し、正確にマッチングさせる。未登録なら空の構造を返す。"""
+        # デフォルトのデータ構造
+        default_data = {
+            "force_desktop": False,
+            "hide_elements": [],
+            "injected_css": "",
+            "action_selectors": {}
+        }
+        if not self.selectors or not url or url == "about:blank":
+            return default_data
         try:
             parsed_url = urlparse(url)
             hostname = parsed_url.netloc
         except:
-            return None
-        # ドメインの部分一致判定を少し厳格にする
+            return default_data
+        # ドメインの部分一致判定
         for domain_key, data in self.selectors.items():
             if domain_key in hostname:
-                return data
-        return None
-    
+                # 見つかった場合も、辞書の欠落を防ぐためデフォルトとマージして返す
+                return {**default_data, **data}
+        return default_data
     
 
 class FloatingNotification(QWidget):
@@ -545,6 +548,7 @@ class ResidentMiniPlayer(QMainWindow):
         self.reload_shortcut.activated.connect(self.reload_and_apply)
         self.current_mode = DisplayMode.EXPANDED # 明示的に初期化
         self._is_switching_mode = False
+        self._mouse_press_pos = None
         
     def handle_show_request(self):
         """
@@ -814,9 +818,13 @@ class ResidentMiniPlayer(QMainWindow):
         
         data = self.selector_manager.get_data_for_url(url)
         if not data:
-            # データがない場合でも、真っさらな状態で表示だけはさせる
             QTimer.singleShot(100, self.browser.show)
             return
+        
+        if data.get("force_desktop"):
+            # 横長（デスクトップ）モードのときだけ実行
+            if self.width() > self.layout_threshold:
+                self._force_desktop_layout()
 
         css = data.get("injected_css", "")
         hide_selectors = json.dumps(data.get("hide_elements", [])) # 事前にJSON化
@@ -883,10 +891,6 @@ class ResidentMiniPlayer(QMainWindow):
         }})();
         """
         self.browser.page().runJavaScript(js_code)
-        
-        if "youtube.com" in url:
-            self._force_desktop_layout()
-        
         # ロード中であれば表示させる
         QTimer.singleShot(150, self.browser.show)
             
@@ -1151,27 +1155,98 @@ class ResidentMiniPlayer(QMainWindow):
         self.browser.findText(text, flags, self._update_hit_count)
 
     def eventFilter(self, obj, event):
-        if event.type() != QEvent.Type.KeyPress:
+        # 監視対象がブラウザ本体、またはその中の入力エリアでない場合はスルー
+        if not (obj == self.browser or obj == self.browser.focusProxy()):
             return super().eventFilter(obj, event)
 
+        etype = event.type()
+
+        # 1. キーボードイベント
+        if etype == QEvent.Type.KeyPress:
+            if self._handle_keypress_event(event):
+                return True
+
+        # 2. ホイールイベント（トラックパッドスワイプ）
+        elif etype == QEvent.Type.Wheel:
+            if self._handle_wheel_event(event):
+                return True
+
+        # 3. マウスボタンイベント（サイドボタン・ドラッグスワイプ）
+        elif etype in [QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease]:
+            if self._handle_mouse_event(event):
+                return True
+
+        return super().eventFilter(obj, event)
+
+    def _handle_keypress_event(self, event):
+        """キーボード操作の判定ロジック"""
         key = event.key()
         modifiers = event.modifiers()
         is_alt = bool(modifiers & Qt.KeyboardModifier.AltModifier)
 
-        # [解決] Alt+Wが効かない原因：ブロックするだけで何もしていなかった
-        # ここで直接メソッドを呼ぶことで、フォーカスがあっても即座に反応させる
         if is_alt:
+            # アプリ制御ショートカット
             shortcuts = self.app_settings.get("shortcuts", {})
             key_char = chr(key).lower() if 32 <= key <= 126 else ""
-
+            
             if key_char == shortcuts.get("show_toggle", "s"):
                 self.handle_show_request()
                 return True
             if key_char == shortcuts.get("hide_completely", "w"):
                 self.update_display_mode(DisplayMode.HIDDEN)
                 return True
+            
+            # ブラウザナビゲーション
+            if key == Qt.Key.Key_Left:
+                self.browser.back()
+                return True
+            elif key == Qt.Key.Key_Right:
+                self.browser.forward()
+                return True
+        return False
 
-        return super().eventFilter(obj, event)
+    def _handle_wheel_event(self, event):
+        """ホイール（トラックパッド）操作の判定ロジック"""
+        delta = event.pixelDelta() if event.pixelDelta() else event.angleDelta()
+        dx = delta.x()
+        
+        if abs(dx) > 20:
+            if dx > 0:
+                self.browser.back()
+            else:
+                self.browser.forward()
+            return True
+        return False
+
+    def _handle_mouse_event(self, event):
+        """マウスボタン・ドラッグスワイプの判定ロジック"""
+        etype = event.type()
+        
+        if etype == QEvent.Type.MouseButtonPress:
+            # サイドボタン
+            if event.button() == Qt.MouseButton.XButton1:
+                self.browser.back()
+                return True
+            elif event.button() == Qt.MouseButton.XButton2:
+                self.browser.forward()
+                return True
+            # ドラッグ開始位置の記録
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._mouse_press_pos = event.position()
+
+        elif etype == QEvent.Type.MouseButtonRelease:
+            if hasattr(self, '_mouse_press_pos') and self._mouse_press_pos:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    delta_x = event.position().x() - self._mouse_press_pos.x()
+                    self._mouse_press_pos = None
+                    
+                    if abs(delta_x) > 100:
+                        if delta_x > 0:
+                            self.browser.back()
+                        else:
+                            self.browser.forward()
+                        return True
+        return False
 
     def toggle_search_container(self):
         """検索バーの表示・非表示を切り替え、適切にフォーカスを制御する"""
@@ -1205,7 +1280,9 @@ class ResidentMiniPlayer(QMainWindow):
         # --- ここに将来、新しいメニュー（例：設定画面を開くなど）を追加しやすくなる ---
         
         menu.addSeparator()
-        menu.addAction("インジケーター化").triggered.connect(self.collapse_to_indicator)
+        menu.addAction("インジケーター化").triggered.connect(
+            lambda: self.update_display_mode(DisplayMode.COLLAPSED)
+        )
         
         menu.exec(QCursor.pos())
 
@@ -1628,11 +1705,6 @@ class ResidentMiniPlayer(QMainWindow):
         self.activateWindow()
         if hasattr(self, 'collapsed_indicator') and self.collapsed_indicator:
             self.collapsed_indicator.hide()
-
-    def collapse_to_indicator(self):
-        """小窓閉鎖時の自動格納"""
-        self.hide()
-        self._show_indicator()
 
     def _on_load_finished(self, ok):
         """ページ読み込み完了時に実行（最終確定フェーズ）"""

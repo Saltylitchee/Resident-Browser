@@ -827,19 +827,25 @@ class ResidentMiniPlayer(QMainWindow):
             const runOptimizations = () => {{
                 if (!document.body) return false;
 
-                // A. CSS注入
+                // A. CSS注入（差分があるときだけ更新）
                 const styleId = 'resident-optimized-style';
+                const newCss = `{css}`;
                 let style = document.getElementById(styleId);
                 if (!style) {{
                     style = document.createElement('style');
                     style.id = styleId;
                     (document.head || document.documentElement).appendChild(style);
                 }}
-                style.textContent = `{css}`;
+                // 【改善点】内容が同じならDOMを触らない（再描画コストの削減）
+                if (style.textContent !== newCss) {{
+                    style.textContent = newCss;
+                }}
 
                 // B. 要素隠蔽
                 const selectors = {hide_selectors};
                 const hideElements = () => {{
+                    // 【改善点】ボディがなければ中断（エラー防止）
+                    if (!document.body) return;
                     selectors.forEach(s => {{
                         document.querySelectorAll(s).forEach(el => {{
                             if (el.style.display !== 'none') el.style.display = 'none';
@@ -847,22 +853,32 @@ class ResidentMiniPlayer(QMainWindow):
                     }});
                 }};
 
+                // 初回実行
                 hideElements();
-                if (window.residentObserver) window.residentObserver.disconnect();
+
+                // 【改善点】既存の監視役を確実に殺してから新しい監視を始める
+                if (window.residentObserver) {{
+                    window.residentObserver.disconnect();
+                    window.residentObserver = null;
+                }}
+                
                 window.residentObserver = new MutationObserver(hideElements);
                 window.residentObserver.observe(document.body, {{ childList: true, subtree: true }});
                 return true;
             }};
 
-            // bodyがなければ待機、あれば実行
+            // 実行制御
             if (!runOptimizations()) {{
-                const observer = new MutationObserver((mutations, obs) => {{
+                // 【改善点】待機用のObserverも二重にならないよう名前をつける
+                if (window.residentBodyWaiter) window.residentBodyWaiter.disconnect();
+                window.residentBodyWaiter = new MutationObserver((mutations, obs) => {{
                     if (document.body) {{
                         runOptimizations();
                         obs.disconnect();
+                        window.residentBodyWaiter = null;
                     }}
                 }});
-                observer.observe(document.documentElement, {{ childList: true }});
+                window.residentBodyWaiter.observe(document.documentElement, {{ childList: true }});
             }}
         }})();
         """
@@ -1645,16 +1661,12 @@ class ResidentMiniPlayer(QMainWindow):
         QTimer.singleShot(200, self.browser.show)
                 
     def _on_url_changed(self, url):
-        """URLが変わった（SPA遷移含む）時の処理"""
-        if url.isValid() and url.toString() != "about:blank":
-            # URLが変わった直後はDOMがない場合が多いので、
-            # 0.2秒後に1回、先行して最適化を試みる
-            QTimer.singleShot(200, self.apply_site_optimizations)
+        self._optimized_for_this_url = False # 新しいURLになったらリセット
 
     def _on_load_progress(self, progress):
-        """読み込み進捗が80%を超えたら、表示をスムーズにするために先行適用"""
-        if progress > 80:
+        if progress > 80 and not getattr(self, '_optimized_for_this_url', False):
             self.apply_site_optimizations()
+            self._optimized_for_this_url = True # このページでは実行済みとする
 
     def show_notification(self, duration):
         """フェードイン開始"""

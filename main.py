@@ -62,6 +62,8 @@ class ConfigManager:
             "last_active_preset_index": 0,
             "global_indicator_scale": 1.0,
             "layout_threshold": 600,
+            "desktop_zoom_default": 0.8,
+            "mobile_zoom_default": 1.0,
             "search_mode": "google",
             "selectors_url": None,
             "developer_notes": {
@@ -216,7 +218,7 @@ class SelectorManager:
         return None
     
     
-    
+
 class FloatingNotification(QWidget):
     def __init__(self, text, color="#00FF7F", bg_color="#2C3E50", bg_alpha=220, duration=2000):
         super().__init__(None)
@@ -430,6 +432,21 @@ class ResidentMiniPlayer(QMainWindow):
             if target_key:
                 self._shortcut_cache.add(target_key)
         return self._shortcut_cache
+    
+    @property
+    def presets(self):
+        """全プリセットのリストを返すプロパティ"""
+        return self.config_manager.data.get("presets", [])
+    
+    @property
+    def _current_preset_idx(self):
+        """現在アクティブなプリセットのインデックスを取得"""
+        return self.app_settings.get("last_active_preset_index", 0)
+
+    @_current_preset_idx.setter
+    def _current_preset_idx(self, value):
+        """インデックスを更新し、app_settingsを同期する"""
+        self.app_settings["last_active_preset_index"] = value
 
     @property
     def current_preset(self):
@@ -442,10 +459,21 @@ class ResidentMiniPlayer(QMainWindow):
             return {}
         
     @property
-    def presets(self):
-        """全プリセットのリストを返すプロパティ"""
-        return self.config_manager.data.get("presets", [])
+    def current_location_index(self):
+        """現在のアクティブなプリセットにおける、ロケーション（サイズ）のインデックスを返す"""
+        return self.current_preset.get("last_location_index", 0)
 
+    @current_location_index.setter
+    def current_location_index(self, value):
+        """インデックスを更新し、同時にプリセットデータ側も同期する"""
+        self.current_preset["last_location_index"] = value
+        
+    @property
+    def notification_color(self):
+        """現在のプリセットに設定された通知色を返す。未設定ならデフォルトの黄緑色を返す。"""
+        styles = self.current_preset.get("indicator_styles", {})
+        return styles.get("notification_color", "#00FF7F")
+        
     @property
     def layout_threshold(self):
         """デスクトップ/モバイルを判定する閾値"""
@@ -456,6 +484,23 @@ class ResidentMiniPlayer(QMainWindow):
         """デスクトップモード時の固定ズーム率"""
         return self.app_settings.get("desktop_zoom_default", 0.8)
     
+    @property
+    def mobile_zoom_default(self):
+        """モバイルモード時の固定ズーム率"""
+        return self.app_settings.get("mobile_zoom_default", 1.0)
+    
+    @property
+    def indicator_icons(self):
+        """再生状態に応じたアイコンの辞書を返す"""
+        # 将来的には設定ファイルから {"playing": "▶", ...} のように上書き可能にする
+        default_icons = {"playing": "♪", "paused": "||", "stopped": "❏"}
+        return self.app_settings.get("indicator_icons", default_icons)
+
+    @property
+    def indicator_screen_margin(self):
+        """画面端からのマージン（ピクセル）"""
+        return self.app_settings.get("indicator_screen_margin", 15)
+    
     def __init__(self, config_manager, selector_manager):
         super().__init__()
         self.config_manager = config_manager
@@ -464,12 +509,8 @@ class ResidentMiniPlayer(QMainWindow):
         self._is_switching_mode = False
         self.collapsed_indicator = None
         self.all_selectors = {}
-        self.current_location_index = 0
         self._last_processed_title = ""
         self._last_search_query = ""
-        # データの準備
-        self._current_preset_idx = self.app_settings.get("last_active_preset_index", 0)
-        self.current_location_index = self.current_preset.get("last_location_index", 0)
         # --- 2. UIとブラウザのセットアップ ---
         self.setWindowTitle("Doppel")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
@@ -486,21 +527,17 @@ class ResidentMiniPlayer(QMainWindow):
         self.browser.loadFinished.connect(self._on_load_finished)
         # --- 5. URLのロード ---
         def start_initial_load():
-            preset = self.current_preset
+            # 1. 現在のウィンドウ幅に応じて、UAとズームの「初期値」を決定
+            # （※適用直後のサイズで判定するため、ここで一度計算する）
             if self.width() > self.layout_threshold:
                 self._set_desktop_cookie_directly()
                 self.browser.setZoomFactor(self.desktop_zoom_default)
                 self.profile.setHttpUserAgent(self.ua_desktop)
-            last_url = preset.get("last_url")
-            if last_url:
-                url_str = str(last_url)
-                # URLに字幕オフのパラメータを追加
-                # cc_load_policy=0: 字幕をデフォルトで非表示にする
-                if "?" in url_str:
-                    url_str += "&cc_load_policy=0"
-                else:
-                    url_str += "?cc_load_policy=0"
-                self.browser.setUrl(QUrl(url_str))
+            else:
+                self.browser.setZoomFactor(self.mobile_zoom_default)
+            # 2. プロパティからURLを取得（cc_load_policyの付与ロジック）
+            last_url = self.current_preset.get("last_url")
+            self.browser.setUrl(self._get_clean_url(last_url))
         # 直接呼び出すのではなく、タイマーで一瞬だけ遅らせる
         # これにより、Geometry（サイズ）が確実にOS側で適用された後にリクエストが飛ぶ
         QTimer.singleShot(50, start_initial_load)
@@ -569,6 +606,22 @@ class ResidentMiniPlayer(QMainWindow):
         # クッキーをストアに登録
         self.browser.page().profile().cookieStore().setCookie(cookie)
         
+    def _get_clean_url(self, raw_url):
+        """
+        URL文字列を加工し、必要なパラメータ（字幕オフ等）を付加してQUrlを返す。
+        """
+        if not raw_url:
+            return QUrl("https://www.google.com")
+        url_str = str(raw_url)
+        # YouTubeの字幕をデフォルトで非表示にするパラメータ
+        # cc_load_policy=0
+        target_param = "cc_load_policy=0"
+        if target_param not in url_str:
+            sep = "&" if "?" in url_str else "?"
+            url_str = f"{url_str}{sep}{target_param}"
+            
+        return QUrl(url_str)
+        
     def capture_current_url(self):
         """Alt + C相当：現在のURLをJSONに保存"""
         url = get_portal_url()
@@ -626,29 +679,36 @@ class ResidentMiniPlayer(QMainWindow):
         )
         
     def apply_preset(self, index):
-        # 1. ガード（範囲チェック）: 全プリセットのリスト（self.presets）に対して行う
-        if index < 0 or index >= len(self.presets):
+        """指定されたインデックスのプリセットに切り替え、UIとブラウザを更新する"""
+        # 1. ガード
+        if not (0 <= index < len(self.presets)):
             return
-        # 2. 状態の保存（切り替え前のデータを確定させる）
+
+        # 2. 状態の保存（現在のURLや座標を今のプリセットに書き込む）
         self.save_current_state()
-        # 3. インデックスの更新（書き込み）
-        # これを更新した瞬間、プロパティ self.current_preset が指す先が切り替わります！
-        self.app_settings["last_active_preset_index"] = index
+
+        # 3. インデックスの更新
+        # プロパティの Setter を使うことで、内部の app_settings も自動更新される
+        self._current_preset_idx = index 
+
         # 4. 同期とロード
-        # 以前のように target_preset という一時変数を作らなくても
-        # self.current_preset と書くだけで常に「新しい方」を参照できる
+        # この時点で self.current_preset は「新しいプリセット」を指している
         self.refresh_favorites_ui()
+        
+        # プリセット切り替え時、そのプリセットが持っていた「最後の場所」を復元する
+        # self.current_location_index プロパティが内部で current_preset を参照していれば、
+        # apply_config_geometry は自動的に正しい位置を再現します。
         self.apply_config_geometry()
+        
         self._update_indicator_with_state("stopped")
-        # URLのロード（プロパティから直接取得）
+        
+        # URLのロード
         last_url = self.current_preset.get("last_url", "https://www.google.com")
-        self.browser.setUrl(QUrl(last_url))
+        self.browser.setUrl(self._get_clean_url(last_url))
+
         # 5. 永続化と通知
         self.config_manager.save_config()
-        self._display_preset_notification(f"Switch -> {self.current_preset['name']}")
-        
-        
-        
+        self._display_preset_notification(f"Switch -> {self.current_preset.get('name', 'Untitled')}")
         
     def refresh_favorites_ui(self):
         """現在のプリセットに基づいてお気に入りボタンを再生成する"""
@@ -1135,6 +1195,52 @@ class ResidentMiniPlayer(QMainWindow):
             self.search_bar.selectAll()
     
     def contextMenuEvent(self, event):
+        """右クリックメニューを表示する"""
+        # QMenu生成とスタイル適用
+        menu = self._create_base_menu()
+        
+        # 1. ブラウザ操作
+        menu.addAction("戻る").triggered.connect(self.browser.back)
+        menu.addAction("進む").triggered.connect(self.browser.forward)
+        menu.addAction("リロード").triggered.connect(self.browser.reload)
+        menu.addSeparator()
+
+        # 2. プリセット切り替え（サブメニュー）
+        self._add_preset_switch_menu(menu)
+        menu.addSeparator()
+
+        # 3. 設定・保存系
+        save_geo_action = menu.addAction("現在のサイズをプリセットに保存")
+        save_geo_action.triggered.connect(self.add_current_geometry_to_preset)
+        
+        # --- ここに将来、新しいメニュー（例：設定画面を開くなど）を追加しやすくなる ---
+        
+        menu.addSeparator()
+        menu.addAction("インジケーター化").triggered.connect(self.collapse_to_indicator)
+        
+        menu.exec(QCursor.pos())
+
+    def _add_preset_switch_menu(self, parent_menu):
+        """プリセット切り替え用サブメニューを構築"""
+        preset_menu = parent_menu.addMenu("プリセット切替")
+        
+        # プロパティを使用してデータを取得
+        presets = self.config_manager.data.get("presets", [])
+        current_idx = self.app_settings.get("last_active_preset_index", 0)
+
+        for i, preset in enumerate(presets):
+            name = preset.get("name", f"Preset {i}")
+            action = preset_menu.addAction(name)
+            
+            # Qt標準のチェックマーク機能を使用
+            action.setCheckable(True)
+            if i == current_idx:
+                action.setChecked(True)
+                
+            action.triggered.connect(lambda _, idx=i: self.apply_preset(idx))
+
+    def _create_base_menu(self):
+        """スタイルの適用されたQMenuを生成する"""
         from PyQt6.QtWidgets import QMenu
         menu = QMenu(self)
         menu.setStyleSheet("""
@@ -1142,57 +1248,21 @@ class ResidentMiniPlayer(QMainWindow):
             QMenu::item { padding: 5px 25px; }
             QMenu::item:selected { background-color: #3a8fb7; color: white; }
         """)
-        # 基本操作
-        menu.addAction("戻る").triggered.connect(self.browser.back)
-        menu.addAction("進む").triggered.connect(self.browser.forward)
-        menu.addAction("リロード").triggered.connect(self.browser.reload)
-        menu.addSeparator()
-        # --- 【新機能】プリセット切り替えサブメニュー ---
-        preset_menu = menu.addMenu("プリセット切替")
-        config_data = self.config_manager.data
-        presets = config_data.get("presets", [])
-        current_idx = config_data["app_settings"].get("last_active_preset_index", 0)
-        for i, preset in enumerate(presets):
-            name = preset.get("name", f"Preset {i}")
-            # 現在選択中のプリセットにはチェックマークをつける（視認性向上）
-            prefix = "● " if i == current_idx else "   "
-            action = preset_menu.addAction(f"{prefix}{name}")
-            # ラムダの引数に現在の i を固定して渡す
-            action.triggered.connect(lambda checked, idx=i: self.apply_preset(idx))
-        menu.addSeparator()
-        # 設定・保存系
-        save_geo_action = menu.addAction("現在のサイズをプリセットに保存")
-        save_geo_action.triggered.connect(self.add_current_geometry_to_preset)
-        menu.addSeparator()
-        close_action = menu.addAction("インジケーター化")
-        close_action.triggered.connect(self.collapse_to_indicator)
-        menu.exec(QCursor.pos())
+        return menu
 
     def add_current_geometry_to_preset(self):
         """現在の状態を『ロックされた新しいパターン』として追加する"""
-        data = self.config_manager.data
-        # 1. 安全にインデックスを取得
-        try:
-            idx = data["app_settings"].get("last_active_preset_index", 0)
-            target_preset = data["presets"][idx]
-        except (IndexError, KeyError):
-            self._display_preset_notification("Error: Preset not found.")
-            return
-        # 2. 現在のウィンドウ情報を取得
         geo = self.geometry()
         new_loc = {
-            "x": geo.x(),
-            "y": geo.y(),
-            "width": geo.width(),
-            "height": geo.height(),
+            "x": geo.x(), "y": geo.y(),
+            "width": geo.width(), "height": geo.height(),
             "opacity": self.windowOpacity(),
-            "is_locked": True  # 新しく追加するものは「ロック」状態
+            "is_locked": True
         }
-        # 3. locations リストに追加 (append)
-        if "locations" not in target_preset:
-            target_preset["locations"] = []
-        target_preset["locations"].append(new_loc)
-        # 4. 保存と通知
+
+        # 安全策：dict.setdefault を使うと「なければ作る、あればそれを使う」を1行で書ける
+        self.current_preset.setdefault("locations", []).append(new_loc)
+
         self.config_manager.save_config()
         self._display_preset_notification("★New Size Pattern Locked & Added!")
         
@@ -1220,88 +1290,81 @@ class ResidentMiniPlayer(QMainWindow):
         
     def cycle_geometry(self):
         """Alt + D: 現在のプリセット内で locations を巡回する"""
-        # 描画のチラつきを抑える
         self.setUpdatesEnabled(False)
         try:
-            # 1. 切り替える前に現在のURLなどを保存
+            # 1. 状態の保存とデータの取得
             self.save_current_state()
-            data = self.config_manager.data
-            idx = data["app_settings"].get("last_active_preset_index", 0)
-            locations = data["presets"][idx].get("locations", [])
+            locations = self.current_preset.get("locations", [])
             if not locations:
                 self._display_preset_notification("No size patterns found.")
                 return
-            # 2. インデックスを次に進める（ループ処理）
+            # 2. インデックスの更新（剰余演算によるループ）
             self.current_location_index = (self.current_location_index + 1) % len(locations)
-            # 3. 新しい位置・サイズを適用
+            # 3. 適用と通知
             self.apply_config_geometry()
-            # 4. 通知を表示
             self._display_preset_notification(f"Size: {self.current_location_index + 1}/{len(locations)}")
         except Exception as e:
             print(f"Error in cycle_geometry: {e}")
         finally:
             self.setUpdatesEnabled(True)
             self.browser.update()
-            preset_idx = self.config_manager.data["app_settings"]["last_active_preset_index"]
-            # 現在のサイズインデックスを保存
-            self.config_manager.data["presets"][preset_idx]["last_location_index"] = self.current_location_index
-            self.config_manager.save_config() # JSONへ書き出し
+            # 代入するだけで内部的に self.current_preset も更新されている
+            self.config_manager.save_config()
 
     def apply_config_geometry(self):
+        """現在選択されているインデックスに基づいて、ウィンドウのサイズと位置を適用する"""
         try:
-            data = self.config_manager.data
-            p_idx = data["app_settings"].get("last_active_preset_index", 0)
-            preset = data["presets"][p_idx]
-            
-            loc = preset["locations"][self.current_location_index]
+            locations = self.current_preset.get("locations", [])
+            if not locations:
+                return
+            loc = locations[self.current_location_index]
             self.setGeometry(loc["x"], loc["y"], loc["width"], loc["height"])
             self.setWindowOpacity(loc.get("opacity", 1.0))
-            
-            # --- ここがポイント：リロードせず、表示を最適化する ---
+            # --- 表示の最適化：マジックナンバーをプロパティへ置き換え ---
             if self.width() > self.layout_threshold:
-                # 横長の場合：ズームを少し下げて「広大なデスクトップ」に見せかける
-                # 1.0(標準)だと427px判定されるため、0.8～0.9程度に設定
-                self.browser.setZoomFactor(0.8)
+                # プロパティを使用（デフォルト0.8）
+                self.browser.setZoomFactor(self.desktop_zoom_default)
                 self._force_desktop_layout()
             else:
-                # 縦長（小窓）の場合：標準のズームに戻す
-                self.browser.setZoomFactor(1.0)
-                
+                # プロパティを使用（デフォルト1.0）
+                self.browser.setZoomFactor(self.mobile_zoom_default)
         except (IndexError, KeyError) as e:
             print(f"Failed to apply geometry: {e}")
     
     def save_current_state(self):
         """現在の状態（URL、およびアンロック時のみ座標）を保存する"""
-        if not hasattr(self, 'config_manager') or self.config_manager is None:
+        # 1. ガード：依存オブジェクトの存在確認
+        if not getattr(self, 'config_manager', None):
             return
         try:
-            data = self.config_manager.data
-            idx = data["app_settings"].get("last_active_preset_index", 0)
-            preset = data["presets"][idx]
-            # 1. URLの保存（これはロックに関係なく最新を保持）
+            # 2. URLの保存（有効なURLのみ）
             current_url = self.browser.url().toString()
-            if current_url and current_url != "about:blank":
-                preset["last_url"] = current_url
-            # 2. 座標情報の保存（アンロック状態の時のみ）
+            if current_url and current_url not in ("about:blank", ""):
+                # プロパティ経由で現在のプリセットを直接更新
+                self.current_preset["last_url"] = current_url
+            # 3. 座標情報の保存（アンロック状態の時のみ）
+            # ※このメソッド内でも self.current_preset プロパティを活用するように修正されている前提
             self._update_geometry_if_unlocked()
-            # 3. ファイルへ書き出し
+            # 4. データの永続化
             self.config_manager.save_config()
         except Exception as e:
-            print(f"Save failed: {e}")
+            # 実際の運用では print だけでなくログ出力が望ましい
+            print(f"Failed to save current state: {e}")
             
     def _update_geometry_if_unlocked(self):
         """現在のスロットがロックされていなければ、メモリ上のデータを更新する"""
-        if not hasattr(self, 'config_manager') or self.config_manager is None:
+        if not getattr(self, 'config_manager', None):
             return
-        data = self.config_manager.data
-        idx = data["app_settings"].get("last_active_preset_index", 0)
-        loc_idx = getattr(self, 'current_location_index', 0)
         try:
-            target_location = data["presets"][idx]["locations"][loc_idx]
-            # ロックされている場合は座標を更新しない
+            # 修正ポイント：current_preset の中の 'locations' リストを参照する
+            locations = self.current_preset.get("locations", [])
+            if not locations:
+                return
+            target_location = locations[self.current_location_index]
+            # ロック状態の判定（設計通り：Trueなら保存しない）
             if target_location.get("is_locked", False):
                 return
-            # アンロック状態なら、現在のウィンドウ座標をメモリに反映
+            # アンロック状態なら、現在のウィンドウ情報を辞書に反映
             geo = self.geometry()
             target_location.update({
                 "x": geo.x(),
@@ -1310,9 +1373,8 @@ class ResidentMiniPlayer(QMainWindow):
                 "height": geo.height(),
                 "opacity": self.windowOpacity()
             })
-            # ※ save_config は呼び出し元の save_current_state 等で行うためここでは不要
-        except (IndexError, KeyError):
-            pass
+        except (IndexError, KeyError) as e:
+            print(f"Failed to update geometry memory: {e}")
         
     def moveEvent(self, event):
         super().moveEvent(event)
@@ -1359,14 +1421,11 @@ class ResidentMiniPlayer(QMainWindow):
         self.page.runJavaScript(script)
         
     def show_floating_notification(self, text):
-        # 1. 全体設定で通知がオフなら何もしない
-        if not self.config_manager.data["app_settings"].get("show_notifications", True):
+        # 1. 全体設定を確認
+        if not self.app_settings.get("show_notifications", True):
             return
-        # 2. 現在のプリセットから通知色を取得
-        preset = self.config_manager.data["presets"][self._current_preset_idx]
-        n_color = preset.get("indicator_styles", {}).get("notification_color", "#00FF7F")
-        # 3. 通知を表示
-        self.notif = FloatingNotification(text, color=n_color)
+        # 2. 通知を表示（プロパティから色を取得）
+        self.notif = FloatingNotification(text, color=self.notification_color)
         
     def _handle_audio_status(self, audible):
         """音が止まっても消さず、アイコン状態のみ更新"""
@@ -1400,78 +1459,102 @@ class ResidentMiniPlayer(QMainWindow):
     # --- インジケーター更新の司令塔 ---
     def _update_indicator_with_state(self, state):
         """【最適化版司令塔】状態変化に応じて、更新の範囲を最小限に抑える"""
-        state = state if state in ['playing', 'paused'] else 'stopped'
-        data = self.config_manager.data
-        try:
-            idx = data["app_settings"].get("last_active_preset_index", 0)
-            preset = data["presets"][idx]
-        except (IndexError, KeyError):
-            preset = {}
-        
-        styles = preset.get("indicator_styles", {})
-        scale = data["app_settings"].get("global_indicator_scale", 1.0)
+        # 状態の正規化
+        state = state if state in ('playing', 'paused') else 'stopped'
+        # プロパティからスマートに取得
+        styles = self.current_preset.get("indicator_styles", {})
+        scale = self.app_settings.get("global_indicator_scale", 1.0)
         shape = styles.get("shape", "rounded_rect")
-
         self._ensure_indicator_exists(scale)
-
-        # --- ここからが「ビクッ」を止める魔法 ---
-        
-        # すでに表示されており、かつ「タイトルが変わっていない」なら、アイコンだけ更新して終了
-        # これにより、全体の再配置（setGeometry）をスキップできる
+        # 現在のタイトルを取得（一度変数に入れて使い回す）
         current_raw_title = self.browser.title()
-        if self.collapsed_indicator.isVisible() and hasattr(self, '_last_processed_title'):
-            if self._last_processed_title == current_raw_title:
-                # アイコンの文字だけを差し替え（これなら一瞬も消えない）
-                icon = {"playing": "♪", "paused": "||"}.get(state, "❏")
-                self.icon_label.setText(icon)
-                return 
-
-        # タイトルが変わっている場合や、初回表示時はフル更新を実行
+        is_visible = self.collapsed_indicator.isVisible()
+        last_title = getattr(self, '_last_processed_title', None)
+        # --- 最適化：タイトル不変なら最小限の更新 ---
+        if is_visible and last_title == current_raw_title:
+            icon = {"playing": "♪", "paused": "||"}.get(state, "❏")
+            self.icon_label.setText(icon)
+            return 
+        # --- フル更新が必要な場合 ---
         self._last_processed_title = current_raw_title
-        
         self.collapsed_indicator.setUpdatesEnabled(False)
-        self._apply_indicator_style(styles, scale)
-        self._set_indicator_content(state, styles)
-        self._finalize_indicator_geometry(shape, scale)
-        self.collapsed_indicator.setUpdatesEnabled(True)
-
-        if not self.collapsed_indicator.isVisible():
+        try:
+            self._apply_indicator_style(styles, scale)
+            self._set_indicator_content(state, styles)
+            self._finalize_indicator_geometry(shape, scale)
+        finally:
+            self.collapsed_indicator.setUpdatesEnabled(True)
+        if not is_visible:
             self.collapsed_indicator.show()
         self.collapsed_indicator.raise_()
 
     # --- 担当1：見た目（スタイル） ---
-    def _apply_indicator_style(self, styles, scale):
-        # 1. 描画クラスへ丸ごと投げる（詳細は向こうにお任せ）
+    def _apply_indicator_style(self):
+        """
+        プロパティから最新のスタイルとスケールを取得し、ラベルに反映する
+        引数をなくすことで、外部からの「お膳立て」を不要にする
+        """
+        # 1. 必要なデータは自分（プロパティ）で取得する
+        styles = self.current_preset.get("indicator_styles", {})
+        scale = self.app_settings.get("global_indicator_scale", 1.0)
+        
+        # 2. 描画クラスへ丸ごと投げる
         self.collapsed_indicator.apply_indicator_styles(styles)
-        # 2. Player側でしか使わない font_size などの計算だけを行う
-        text_color = styles.get("text_color", "#00FF00") # CSS反映用に取得
+        
+        # 3. フォント周りの計算と反映
+        text_color = styles.get("text_color", "#00FF00")
         font_size = int(10 * scale)
-        label_style = f"color: {text_color}; font-weight: bold; font-size: {font_size}pt; background: transparent; border: none;"
+        
+        label_style = (
+            f"color: {text_color}; "
+            f"font-weight: bold; "
+            f"font-size: {font_size}pt; "
+            f"background: transparent; "
+            f"border: none;"
+        )
+        
         self.icon_label.setStyleSheet(label_style)
         self.text_label.setStyleSheet(label_style)
 
     # --- 担当2：中身（コンテンツ） ---
-    def _set_indicator_content(self, state, styles):
-        # アイコンの決定
-        icon = {"playing": "♪", "paused": "||"}.get(state, "❏")
+    def _set_indicator_content(self, state):
+        """
+        再生状態に応じたアイコンと、加工したタイトルをラベルに設定する。
+        スタイル（最大文字数など）はプロパティから取得する。
+        """
+        # プロパティからアイコン辞書を取得して適用
+        icon = self.indicator_icons.get(state, self.indicator_icons["stopped"])
         self.icon_label.setText(icon)
 
-        # タイトルの加工
+        # 2. タイトルの加工（正規表現で通知バッジなどを除去）
         raw_title = self.browser.title()
         clean_title = re.sub(r'^\(\d+\)\s*', '', raw_title)
-        if not clean_title or clean_title == "about:blank": clean_title = "Doppel"
+        if not clean_title or clean_title == "about:blank": 
+            clean_title = "Doppel"
         
-        # プリセットごとの最大長さを取得
+        # 3. プリセットごとの最大長さをプロパティから取得
+        styles = self.current_preset.get("indicator_styles", {})
         max_len = styles.get("max_title_length", 25)
         
+        # 4. 文字数制限の適用
         if len(clean_title) > max_len:
             display_title = clean_title[:max_len] + "..."
         else:
             display_title = clean_title
+            
         self.text_label.setText(display_title)
 
     # --- 担当3：配置（ジオメトリ） ---
-    def _finalize_indicator_geometry(self, shape, scale):
+    def _finalize_indicator_geometry(self):
+        """
+        プロパティから形状とスケールを取得し、インジケーターの最終的なサイズと位置を確定させる。
+        """
+        # 1. 必要な情報をプロパティから取得
+        styles = self.current_preset.get("indicator_styles", {})
+        shape = styles.get("shape", "rounded_rect")
+        scale = self.app_settings.get("global_indicator_scale", 1.0)
+
+        # 2. 形状に応じたサイズ計算
         if shape == "circle":
             self.text_label.hide()
             size = int(50 * scale)
@@ -1484,20 +1567,21 @@ class ResidentMiniPlayer(QMainWindow):
             self.collapsed_indicator.setMinimumSize(int(80 * scale), 0)
             self.icon_label.setFixedWidth(int(30 * scale))
             
-            # 余白設定
+            # 余白設定（スケーリング対応）
             m = (int(12*scale), int(5*scale), int(15*scale), int(5*scale))
             self.collapsed_indicator.layout().setContentsMargins(*m)
             
-            # 【重要】内容に基づいてサイズを計算
+            # 内容に基づいて最適なサイズを再計算
             self.collapsed_indicator.layout().activate()
             target_size = self.collapsed_indicator.layout().sizeHint()
 
-        # 右下座標の計算
+        # 3. 画面端（右下）の座標計算
         screen = QApplication.primaryScreen().availableGeometry()
-        new_x = screen.right() - target_size.width() - 15
-        new_y = screen.bottom() - target_size.height() - 15
+        margin = self.indicator_screen_margin # プロパティを使用
+        new_x = screen.right() - target_size.width() - margin
+        new_y = screen.bottom() - target_size.height() - margin
 
-        # 位置とサイズを同時に確定（震え防止）
+        # 4. 位置とサイズを同時に確定（setGeometryを使うことで一回の描画更新で済ませる）
         self.collapsed_indicator.setGeometry(new_x, new_y, target_size.width(), target_size.height())
         self.collapsed_indicator.setFixedSize(target_size)
 

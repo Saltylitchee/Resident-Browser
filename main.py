@@ -794,62 +794,84 @@ class ResidentMiniPlayer(QMainWindow):
         
         self.browser.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.browser.installEventFilter(self)
-        self.page.loadFinished.connect(self._install_proxy_filter)
+
+        # --- 最適化タイミングの多層化 ---
+        # 1. ページ読み込み完了時（確実な最終実行）
+        self.page.loadFinished.connect(self._on_load_finished)
+        
+        # 2. SPA対策：URLが変わった瞬間（即座に監視を開始したい）
+        self.browser.urlChanged.connect(self._on_url_changed)
+        
+        # 3. 読み込み中（DOMが構築され始めた段階）で先行してCSSを当てる
+        self.browser.loadProgress.connect(self._on_load_progress)
+
         self.browser.hide()
         
     def apply_site_optimizations(self):
-        """
-        SelectorManagerを使用して、サイト固有のCSS注入・要素隠蔽・レイアウト調整を
-        一括で実行する。
-        """
         url = self.browser.url().toString()
         if not url or url == "about:blank":
             return
         
-        # 1. データの取得（SelectorManagerに一任）
         data = self.selector_manager.get_data_for_url(url)
         if not data:
+            # データがない場合でも、真っさらな状態で表示だけはさせる
+            QTimer.singleShot(100, self.browser.show)
             return
+
         css = data.get("injected_css", "")
-        hide_selectors = data.get("hide_elements", [])
-        # 2. JSコードの構築
-        # f-string内での波括弧は二重 {{ }} でエスケープ
+        hide_selectors = json.dumps(data.get("hide_elements", [])) # 事前にJSON化
+
+        # JSコードの強化：document.body の存在チェックを追加
         js_code = f"""
         (function() {{
-            // A. CSSの注入
-            const styleId = 'resident-optimized-style';
-            let style = document.getElementById(styleId);
-            if (!style) {{
-                style = document.createElement('style');
-                style.id = styleId;
-                (document.head || document.documentElement).appendChild(style);
-            }}
-            style.textContent = `{css}`;
+            const runOptimizations = () => {{
+                if (!document.body) return false;
 
-            // B. 要素隠蔽（動的監視）
-            const hideElements = () => {{
-                const selectors = {json.dumps(hide_selectors)};
-                selectors.forEach(s => {{
-                    document.querySelectorAll(s).forEach(el => {{
-                        if (el.style.display !== 'none') {{
-                            el.style.display = 'none';
-                        }}
+                // A. CSS注入
+                const styleId = 'resident-optimized-style';
+                let style = document.getElementById(styleId);
+                if (!style) {{
+                    style = document.createElement('style');
+                    style.id = styleId;
+                    (document.head || document.documentElement).appendChild(style);
+                }}
+                style.textContent = `{css}`;
+
+                // B. 要素隠蔽
+                const selectors = {hide_selectors};
+                const hideElements = () => {{
+                    selectors.forEach(s => {{
+                        document.querySelectorAll(s).forEach(el => {{
+                            if (el.style.display !== 'none') el.style.display = 'none';
+                        }});
                     }});
-                }});
+                }};
+
+                hideElements();
+                if (window.residentObserver) window.residentObserver.disconnect();
+                window.residentObserver = new MutationObserver(hideElements);
+                window.residentObserver.observe(document.body, {{ childList: true, subtree: true }});
+                return true;
             }};
 
-            // 初回実行と監視の開始
-            hideElements();
-            if (window.residentObserver) window.residentObserver.disconnect();
-            window.residentObserver = new MutationObserver(hideElements);
-            window.residentObserver.observe(document.body, {{ childList: true, subtree: true }});
+            // bodyがなければ待機、あれば実行
+            if (!runOptimizations()) {{
+                const observer = new MutationObserver((mutations, obs) => {{
+                    if (document.body) {{
+                        runOptimizations();
+                        obs.disconnect();
+                    }}
+                }});
+                observer.observe(document.documentElement, {{ childList: true }});
+            }}
         }})();
         """
-        # 3. 実行
         self.browser.page().runJavaScript(js_code)
-        # 4. 特定ドメインの追加調整（デスクトップレイアウト強制など）
+        
         if "youtube.com" in url:
             self._force_desktop_layout()
+        
+        # ロード中であれば表示させる
         QTimer.singleShot(150, self.browser.show)
             
     def load_selectors(self):
@@ -1597,19 +1619,42 @@ class ResidentMiniPlayer(QMainWindow):
         self._show_indicator()
 
     def _on_load_finished(self, ok):
-        """ページ読み込み完了時に実行"""
-        if ok:
-            # 1. サイト固有のカスタマイズ（広告ブロック等）を適用
-            self.apply_site_optimizations()
+        """ページ読み込み完了時に実行（最終確定フェーズ）"""
+        if not ok:
+            return
+
+        # 1. 既存のプロキシフィルタ設定などがあれば実行
+        if hasattr(self, '_install_proxy_filter'):
+            self._install_proxy_filter()
+
+        # 2. サイト固有のカスタマイズを適用（1回目：即時）
+        self.apply_site_optimizations()
+        
+        # 3. レイアウトの調整
+        if self.width() > self.layout_threshold:
+            self._force_desktop_layout()
             
-            # 2. 横長の場合、再度デスクトップ化を強制
-            if self.width() > self.layout_threshold:
-                self._force_desktop_layout()
+        # 4. 「ダメ押し」の遅延実行
+        # 読み込み完了後に動的に生成される広告や、遅れてくるレイアウト崩れ対策
+        QTimer.singleShot(1000, self.apply_site_optimizations)
+        
+        if self.width() > self.layout_threshold:
+            QTimer.singleShot(1500, self._force_desktop_layout)
+
+        # 5. 最後にウィンドウを表示（まだ隠れている場合への保険）
+        QTimer.singleShot(200, self.browser.show)
                 
-            # 3. 1秒後にもう一度ダメ押し（動的な要素の読み込み待ち）
-            QTimer.singleShot(1000, self.apply_site_optimizations)
-            if self.width() > self.layout_threshold:
-                QTimer.singleShot(1500, self._force_desktop_layout)
+    def _on_url_changed(self, url):
+        """URLが変わった（SPA遷移含む）時の処理"""
+        if url.isValid() and url.toString() != "about:blank":
+            # URLが変わった直後はDOMがない場合が多いので、
+            # 0.2秒後に1回、先行して最適化を試みる
+            QTimer.singleShot(200, self.apply_site_optimizations)
+
+    def _on_load_progress(self, progress):
+        """読み込み進捗が80%を超えたら、表示をスムーズにするために先行適用"""
+        if progress > 80:
+            self.apply_site_optimizations()
 
     def show_notification(self, duration):
         """フェードイン開始"""

@@ -19,7 +19,9 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QCursor, QPainter, QBrush, QColor, QPen, QShortcut, QKeySequence
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
+from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings, QWebEngineScript
+
+
 
 # ==========================================
 # 1. 定数・デフォルト設定の集約
@@ -549,6 +551,7 @@ class ResidentMiniPlayer(QMainWindow):
         self.current_mode = DisplayMode.EXPANDED # 明示的に初期化
         self._is_switching_mode = False
         self._mouse_press_pos = None
+        self._is_optimized_for_current_url = False
         
     def handle_show_request(self):
         """
@@ -796,17 +799,15 @@ class ResidentMiniPlayer(QMainWindow):
         self.browser = QWebEngineView()
         self.browser.setPage(self.page)
         
+        # --- ページ遷移時のチラつき（白い閃光）をゼロにするメソッド(使うときまでコメントアウトでオフにしておく) ---
+        # self.setup_flicker_free_script()
+        
         self.browser.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.browser.installEventFilter(self)
 
         # --- 最適化タイミングの多層化 ---
-        # 1. ページ読み込み完了時（確実な最終実行）
         self.page.loadFinished.connect(self._on_load_finished)
-        
-        # 2. SPA対策：URLが変わった瞬間（即座に監視を開始したい）
         self.browser.urlChanged.connect(self._on_url_changed)
-        
-        # 3. 読み込み中（DOMが構築され始めた段階）で先行してCSSを当てる
         self.browser.loadProgress.connect(self._on_load_progress)
 
         self.browser.hide()
@@ -820,6 +821,8 @@ class ResidentMiniPlayer(QMainWindow):
         if not data:
             QTimer.singleShot(100, self.browser.show)
             return
+        
+        self._is_optimized_for_current_url = True
         
         if data.get("force_desktop"):
             # 横長（デスクトップ）モードのときだけ実行
@@ -893,6 +896,43 @@ class ResidentMiniPlayer(QMainWindow):
         self.browser.page().runJavaScript(js_code)
         # ロード中であれば表示させる
         QTimer.singleShot(150, self.browser.show)
+        
+    def setup_flicker_free_script(self):
+        """設定から背景色を取得し、ページ遷移時のチラつき防止スクリプトを注入"""
+        
+        # 1. SelectorManager等から現在のドメイン設定を取得
+        # ※設定がない場合のデフォルト値を #121212 (ダークグレー) に設定
+        current_url = self.browser.url().toString()
+        # ここでは仮に self.app_settings から色を引く想定
+        # 実際にはURLからドメインを特定して色を選択するロジックをここに挟めます
+        bg_color = "#121212" 
+
+        # 2. JavaScriptに色を埋め込む (Pythonの f-string を使用)
+        js_code = f"""
+        (function() {{
+            var css = 'html {{ background-color: {bg_color} !important; }}';
+            var style = document.createElement('style');
+            style.type = 'text/css';
+            style.id = 'anti-flash-script';
+            if (style.styleSheet) {{
+                style.styleSheet.cssText = css;
+            }} else {{
+                style.appendChild(document.createTextNode(css));
+            }}
+            document.documentElement.appendChild(style);
+        }})();
+        """
+
+        script = QWebEngineScript()
+        script.setSourceCode(js_code)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setRunsOnSubFrames(True)
+
+        self.browser.page().profile().scripts().insert(script)
+        
+        # 3. ブラウザ自体の背景色も同期させる
+        self.browser.page().setBackgroundColor(QColor(bg_color))
             
     def load_selectors(self):
         """外部設定ファイルを読み込み、メモリ上の変数に格納する"""
@@ -1527,31 +1567,44 @@ class ResidentMiniPlayer(QMainWindow):
 
     # --- インジケーター更新の司令塔 ---
     def _update_indicator_with_state(self, state):
-        """【最新版司令塔】状態を正規化し、自律的な各担当メソッドへ処理を委譲する"""
-        # 1. 状態の正規化（playing / paused / stopped）
+        """【最新・最適化版司令塔】タイトルが同じなら中身の更新のみを行い、再配置をスキップする"""
+        # 1. 状態の正規化
         state = state if state in ('playing', 'paused') else 'stopped'
-        # 2. インジケーターの存在確認とスケール反映（ここは初期化として維持）
+        
+        # 2. スケール反映と存在確認
         scale = self.app_settings.get("global_indicator_scale", 1.0)
         self._ensure_indicator_exists(scale)
-        # 3. 最適化：タイトルと状態が前回と同じなら、重い更新をスキップ
+        
+        # 3. 判定準備
         current_raw_title = self.browser.title()
         is_visible = self.collapsed_indicator.isVisible()
         last_title = getattr(self, '_last_processed_title', None)
         last_state = getattr(self, '_last_processed_state', None)
+
+        # A. 完全一致なら何もせずリターン（最も軽いパス）
         if is_visible and last_title == current_raw_title and last_state == state:
             return
-        # --- フル更新の開始 ---
+
+        # B. 【魔法のパス】タイトルは同じだが状態だけが違う場合
+        # アイコンの更新（_set_indicator_content）だけを行い、再配置（_finalize_indicator_geometry）をスキップ
+        if is_visible and last_title == current_raw_title:
+            self._set_indicator_content(state)  # アイコン（中身）だけ書き換え
+            self._last_processed_state = state   # 状態を保存
+            return # ここで終了！ geometry の再計算をさせない
+
+        # --- C. フル更新（タイトルが変わった場合や初回表示時） ---
         self._last_processed_title = current_raw_title
         self._last_processed_state = state
-        # 描画のチラつきを抑える
+        
         self.collapsed_indicator.setUpdatesEnabled(False)
         try:
-            # 【ここを修正】引数を渡さず、メソッド自身の自律性に任せる
+            # 担当メソッドへの自律的委譲
             self._apply_indicator_style()       # 担当1：見た目
-            self._set_indicator_content(state)  # 担当2：中身（状態だけは渡す）
-            self._finalize_indicator_geometry() # 担当3：配置
+            self._set_indicator_content(state)  # 担当2：中身
+            self._finalize_indicator_geometry() # 担当3：配置（ここでビクッとする可能性がある）
         finally:
             self.collapsed_indicator.setUpdatesEnabled(True)
+
         # 4. 表示状態の管理
         if not is_visible:
             self.collapsed_indicator.show()
@@ -1733,12 +1786,17 @@ class ResidentMiniPlayer(QMainWindow):
         QTimer.singleShot(200, self.browser.show)
                 
     def _on_url_changed(self, url):
-        self._optimized_for_this_url = False # 新しいURLになったらリセット
+        """URLが変わったら最適化フラグをリセットする"""
+        # about:blank などの空ページは無視
+        if url.toString() and url.toString() != "about:blank":
+            self._is_optimized_for_current_url = False
 
     def _on_load_progress(self, progress):
-        if progress > 80 and not getattr(self, '_optimized_for_this_url', False):
+        """読み込み中に先行して最適化をかける（ただし1回だけ）"""
+        # 80%以上、かつ、まだそのURLで最適化を実行していない場合のみ発動
+        if progress > 80 and not self._is_optimized_for_current_url:
             self.apply_site_optimizations()
-            self._optimized_for_this_url = True # このページでは実行済みとする
+            self._is_optimized_for_current_url = True
 
     def show_notification(self, duration):
         """フェードイン開始"""

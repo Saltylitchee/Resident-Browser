@@ -45,8 +45,8 @@ COLOR_ACCENT = "#00FF7F"    # 通知用
 COLOR_INDICATOR = "#00FF00" # インジケーター用
 COLOR_BG_DARK = "#000000"
 COLOR_BG_NOTIF = "#3A01C1"
-COLOR_SUB_BUTTON_DEFAULT = "#CCCCCC"
-COLOR_SUB_BUTTON_FAVORITED = "#FFD700"
+COLOR_SUB_BUTTON_DEFAULT = "#333333"
+COLOR_SUB_BUTTON_FAVORITED = "#4285f4"
 
 # ==============================================================================
 # 5. 通知・インジケーター・UI詳細設定

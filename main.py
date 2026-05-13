@@ -57,7 +57,7 @@ from constants import (
     # 7. ショートカット・操作設定
     DEFAULT_MODIFIER, KEY_HIDE, KEY_SHOW, KEY_COPY, KEY_PASTE, KEY_CYCLE,
     SEARCH_MODES, ASCII_PRINTABLE_MIN, ASCII_PRINTABLE_MAX,
-    SWIPE_THRESHOLD_X, WHEEL_SWIPE_THRESHOLD,
+    WHEEL_MAX_SPEED_LIMIT, WHEEL_SWIPE_ACCUM_TARGET, SWIPE_THRESHOLD_X,
     HOTKEY_DEBOUNCE_SEC, HOTKEY_MONITOR_INTERVAL_MS,
     MAX_NUM_SHORTCUTS, MAX_FAVORITES, ZOOM_MIN_LIMIT, ZOOM_MAX_LIMIT,
 
@@ -561,6 +561,9 @@ class ResidentMiniPlayer(QMainWindow):
         self._is_switching_mode = False
         self._mouse_press_pos = None
         self._is_optimized_for_current_url = False
+        self.swipe_acc_x = 0
+        self.last_swipe_time = 0
+        self.last_wheel_time = 0
         
     def handle_show_request(self):
         """
@@ -1302,17 +1305,51 @@ class ResidentMiniPlayer(QMainWindow):
         return False
 
     def _handle_wheel_event(self, event):
-        """ホイール（トラックパッド）操作の判定ロジック"""
+        current_time = time.time()
+    
         delta = event.pixelDelta() if event.pixelDelta() else event.angleDelta()
         dx = delta.x()
+        dy = delta.y()
+
+        # --- 1. 状態のリセットロジック ---
+        last_t = getattr(self, 'last_wheel_time', 0)
+        if current_time - last_t > 0.1:
+            self.swipe_start_time = current_time
+            self.swipe_acc_x = 0
+            self.event_count = 0  # イベントの発生回数をカウント
+        self.last_wheel_time = current_time
+
+        # --- 2. 基本ガード ---
+        if abs(dy) > abs(dx):
+            self.swipe_acc_x = 0
+            return False
         
-        # 閾値を定数化
-        if abs(dx) > WHEEL_SWIPE_THRESHOLD:
-            if dx > 0:
-                self.browser.back()
-            else:
-                self.browser.forward()
-            return True
+        if (current_time * 1000) - getattr(self, 'last_swipe_time', 0) < 600:
+            return False
+
+        # --- 3. 蓄積とカウント ---
+        self.swipe_acc_x += dx
+        self.event_count = getattr(self, 'event_count', 0) + 1 # 回数をカウント
+        
+        duration = current_time - getattr(self, 'swipe_start_time', current_time)
+
+        # --- 4. 実行判定（条件を3段構えにする） ---
+        # 1. 継続時間（0.1秒以上）
+        # 2. 累積距離（WHEEL_SWIPE_ACCUM_TARGET）
+        # 3. イベントの密度（例：15回以上のイベントが連続していること）
+        if duration > 0.1 and abs(self.swipe_acc_x) > WHEEL_SWIPE_ACCUM_TARGET:
+            if getattr(self, 'event_count', 0) > 25: # ★ここがノイズ除去の肝
+                if self.swipe_acc_x > 0:
+                    self.browser.back()
+                else:
+                    self.browser.forward()
+                
+                self.last_swipe_time = current_time * 1000
+                self.swipe_acc_x = 0 
+                self.swipe_start_time = 0
+                self.event_count = 0
+                return True
+        
         return False
 
     def _handle_mouse_event(self, event):

@@ -22,3 +22,5 @@ config.json
 
 #実行ファイルのバックアップ
 backup.py
+
+memo.md

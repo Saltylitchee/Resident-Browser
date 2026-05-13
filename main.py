@@ -564,6 +564,7 @@ class ResidentMiniPlayer(QMainWindow):
         self.swipe_acc_x = 0
         self.last_swipe_time = 0
         self.last_wheel_time = 0
+        self._is_left_button_pressed = False
         
     def handle_show_request(self):
         """
@@ -1355,6 +1356,15 @@ class ResidentMiniPlayer(QMainWindow):
     def _handle_mouse_event(self, event):
         """マウスボタン・ドラッグスワイプの判定ロジック"""
         etype = event.type()
+        
+        if etype == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._is_left_button_pressed = True # 選択開始
+                self._mouse_press_pos = event.position()
+        
+        elif etype == QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._is_left_button_pressed = False # 選択終了
         
         if etype == QEvent.Type.MouseButtonPress:
             # ゲーミングマウスなどのサイドボタン（進む・戻る）

@@ -1307,7 +1307,17 @@ class ResidentMiniPlayer(QMainWindow):
 
     def _handle_wheel_event(self, event):
         current_time = time.time()
-    
+
+        # --- 0. クールダウン・ボタン押下中ガード ---
+        # マウス（左クリック）を離した直後の一定時間はノイズが多いため無視
+        release_cooldown = 0.15  # 秒単位で調整
+        if current_time - getattr(self, '_last_release_time', 0) < release_cooldown:
+            return False
+        
+        # 選択中（左ボタン押下中）はホイールによる「戻る・進む」を即座にブロック
+        if getattr(self, '_is_left_button_pressed', False):
+            return False
+
         delta = event.pixelDelta() if event.pixelDelta() else event.angleDelta()
         dx = delta.x()
         dy = delta.y()
@@ -1317,11 +1327,12 @@ class ResidentMiniPlayer(QMainWindow):
         if current_time - last_t > 0.1:
             self.swipe_start_time = current_time
             self.swipe_acc_x = 0
-            self.event_count = 0  # イベントの発生回数をカウント
+            self.event_count = 0
         self.last_wheel_time = current_time
 
         # --- 2. 基本ガード ---
-        if abs(dy) > abs(dx):
+        # 垂直方向の動きが強い、または1回あたりの移動量が異常に大きい（スパイク）場合は無視
+        if abs(dy) > abs(dx) or abs(dx) > 100: # 100は環境に合わせて要調整
             self.swipe_acc_x = 0
             return False
         
@@ -1330,16 +1341,14 @@ class ResidentMiniPlayer(QMainWindow):
 
         # --- 3. 蓄積とカウント ---
         self.swipe_acc_x += dx
-        self.event_count = getattr(self, 'event_count', 0) + 1 # 回数をカウント
+        self.event_count = getattr(self, 'event_count', 0) + 1
         
         duration = current_time - getattr(self, 'swipe_start_time', current_time)
 
-        # --- 4. 実行判定（条件を3段構えにする） ---
-        # 1. 継続時間（0.1秒以上）
-        # 2. 累積距離（WHEEL_SWIPE_ACCUM_TARGET）
-        # 3. イベントの密度（例：15回以上のイベントが連続していること）
+        # --- 4. 実行判定 ---
         if duration > 0.1 and abs(self.swipe_acc_x) > WHEEL_SWIPE_ACCUM_TARGET:
-            if getattr(self, 'event_count', 0) > 25: # ★ここがノイズ除去の肝
+            # イベント密度（25回以上）を維持しつつ判定
+            if getattr(self, 'event_count', 0) > 25:
                 if self.swipe_acc_x > 0:
                     self.browser.back()
                 else:
@@ -1354,17 +1363,18 @@ class ResidentMiniPlayer(QMainWindow):
         return False
 
     def _handle_mouse_event(self, event):
-        """マウスボタン・ドラッグスワイプの判定ロジック"""
         etype = event.type()
         
         if etype == QEvent.Type.MouseButtonPress:
             if event.button() == Qt.MouseButton.LeftButton:
-                self._is_left_button_pressed = True # 選択開始
+                self._is_left_button_pressed = True
                 self._mouse_press_pos = event.position()
         
         elif etype == QEvent.Type.MouseButtonRelease:
             if event.button() == Qt.MouseButton.LeftButton:
-                self._is_left_button_pressed = False # 選択終了
+                self._is_left_button_pressed = False
+                self._last_release_time = time.time() # ★離した時間を記録
+                self._mouse_press_pos = None
         
         if etype == QEvent.Type.MouseButtonPress:
             # ゲーミングマウスなどのサイドボタン（進む・戻る）

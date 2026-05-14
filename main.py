@@ -50,12 +50,12 @@ from constants import (
     VIEWPORT_DESKTOP, VIEWPORT_MOBILE,
     SEARCH_BAR_HEIGHT, SEARCH_TOGGLE_SIZE,
     SEARCH_SUB_SPACING, FIND_DEFAULT_COUNT,
-    ICON_FAVORITE, ICON_FIND_IN_PAGE,
     EXTERNAL_BROWSER_KEYWORDS, TARGET_BROWSER_KEYWORDS,
     EXCLUDE_WINDOW_KEYWORDS, EXPLORER_CLASS_NAME,
 
     # 7. ショートカット・操作設定
     DEFAULT_MODIFIER, KEY_HIDE, KEY_SHOW, KEY_COPY, KEY_PASTE, KEY_CYCLE,
+    ACTION_HIDE, ACTION_TOGGLE, ACTION_COPY, ACTION_PASTE, ACTION_CYCLE,
     SEARCH_MODES, ASCII_PRINTABLE_MIN, ASCII_PRINTABLE_MAX,
     WHEEL_RELEASE_COOLDOWN, WHEEL_MAX_SPEED_LIMIT, WHEEL_RESET_THRESHOLD,
     WHEEL_MIN_DX_GUARD, WHEEL_AFTER_SWIPE_COOLDOWN,
@@ -1284,9 +1284,9 @@ class ResidentMiniPlayer(QMainWindow):
             key_char = chr(key).lower() if ASCII_PRINTABLE_MIN <= key <= ASCII_PRINTABLE_MAX else ""
             
             # 判定対象を明確化（cycle_size 'd' を追加）
-            show_key = shortcuts.get("show_toggle", "s")
-            hide_key = shortcuts.get("hide_completely", "w")
-            cycle_key = shortcuts.get("cycle_size", "d")
+            show_key = shortcuts.get(ACTION_TOGGLE, "s")
+            hide_key = shortcuts.get(ACTION_HIDE, "w")
+            cycle_key = shortcuts.get(ACTION_CYCLE, "d")
 
             if key_char == show_key:
                 self.handle_show_request()
@@ -1932,6 +1932,7 @@ def check_hotkeys():
     if current_window is None:
         return
 
+    # 設定ファイルからショートカット情報を取得
     shortcuts = current_window.config_manager.data.get("app_settings", {}).get("shortcuts", {})
     modifier = shortcuts.get("modifier", DEFAULT_MODIFIER).lower()
     
@@ -1942,32 +1943,39 @@ def check_hotkeys():
     is_shift = keyboard.is_pressed('shift')
     is_ctrl = keyboard.is_pressed('ctrl')
 
-    # Ctrlが混ざっている場合は、eventFilter側の処理（Ctrl+F/R）に任せるため、
-    # ここでのグローバル処理（Alt+S等）はスキップする
     if is_ctrl:
         return
 
-    # キーマッピングの構築
+    # キーマッピングの構築：定数をデフォルト値として活用
+    # configに設定がない場合は constants.py の値が使われる
+    key_hide = shortcuts.get(ACTION_HIDE, KEY_HIDE)
+    key_show = shortcuts.get(ACTION_TOGGLE, KEY_SHOW)
+    key_cycle = shortcuts.get(ACTION_CYCLE, KEY_CYCLE)
+    key_copy = shortcuts.get(ACTION_COPY, KEY_COPY)
+    key_paste = shortcuts.get(ACTION_PASTE, KEY_PASTE)
+
     mapping = {
-        shortcuts.get("hide_completely", "w"): bridge.hide_completely_requested,
-        shortcuts.get("show_toggle", "s"):      bridge.show_requested,
-        shortcuts.get("copy", "c"):             bridge.copy_requested,
-        shortcuts.get("paste", "v"):           bridge.paste_requested,
-        shortcuts.get("cycle_size", "d"):      bridge.cycle_geometry_requested
+        key_hide:  bridge.hide_completely_requested,
+        key_show:  bridge.show_requested,
+        key_cycle: bridge.cycle_geometry_requested,
+        key_copy:  bridge.copy_requested,
+        key_paste: bridge.paste_requested
     }
 
     for key, signal in mapping.items():
         if keyboard.is_pressed(key):
-            # Shift除外ルールの適用
-            if key in ["s", "d"] and is_shift:
+            # Shift除外ルールの適用（文字入力との競合回避）
+            # ここも定数で判定することで、キー設定が変わってもルールが維持される
+            if key in [key_show, key_cycle] and is_shift:
                 continue
+                
             signal.emit()
             last_action_time = now
             return
 
     # 数字キー（プリセット切替）
     if current_window.app_settings.get("enable_number_shortcuts", True):
-        for i in range(1, 10): # 1-9
+        for i in range(1, 10): 
             if keyboard.is_pressed(str(i)):
                 bridge.preset_switch_requested.emit(i - 1)
                 last_action_time = now

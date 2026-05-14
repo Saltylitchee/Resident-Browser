@@ -140,9 +140,21 @@ KEY_CYCLE = "d"
 
 ASCII_PRINTABLE_MIN = 32
 ASCII_PRINTABLE_MAX = 126
-WHEEL_MAX_SPEED_LIMIT = 100 # 1. 指を離す瞬間のノイズを捨てるための「一瞬の速さの上限」
-WHEEL_SWIPE_ACCUM_TARGET = 100 # 2. 合計でどれだけ動かしたら発火するか（蓄積距離の壁）
-SWIPE_THRESHOLD_X = 100
+
+# --- トラックパッド・スワイプ詳細設定 ---
+WHEEL_RELEASE_COOLDOWN = 0.15      # 指を離した直後の不感帯（秒）
+WHEEL_MAX_SPEED_LIMIT = 100        # スパイクノイズ除去用の上限
+WHEEL_RESET_THRESHOLD = 0.12       # 蓄積をリセットする無操作時間（秒）
+WHEEL_MIN_DX_GUARD = 3             # 遊び（これ以下の動きは無視）
+WHEEL_AFTER_SWIPE_COOLDOWN = 800   # 連続発火を防ぐクールダウン（ミリ秒）
+
+# --- 実行判定しきい値 ---
+WHEEL_SWIPE_MIN_DURATION = 0.15    # 最低スワイプ継続時間（秒）
+WHEEL_SWIPE_ACCUM_TARGET = 100    # 必要蓄積距離
+WHEEL_MIN_EVENT_COUNT = 40         # 必要イベント数
+WHEEL_VELOCITY_THRESHOLD = 1100    # 必要最低速度    # これ以下の微小な動きは「遊び」として捨てる
+
+SWIPE_THRESHOLD_X = 100         # マウスクリック＋ドラッグ時の発火閾値
 HOTKEY_DEBOUNCE_SEC = 0.25
 HOTKEY_MONITOR_INTERVAL_MS = 100
 MAX_NUM_SHORTCUTS = 10

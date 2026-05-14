@@ -57,8 +57,11 @@ from constants import (
     # 7. ショートカット・操作設定
     DEFAULT_MODIFIER, KEY_HIDE, KEY_SHOW, KEY_COPY, KEY_PASTE, KEY_CYCLE,
     SEARCH_MODES, ASCII_PRINTABLE_MIN, ASCII_PRINTABLE_MAX,
-    WHEEL_MAX_SPEED_LIMIT, WHEEL_SWIPE_ACCUM_TARGET, SWIPE_THRESHOLD_X,
-    HOTKEY_DEBOUNCE_SEC, HOTKEY_MONITOR_INTERVAL_MS,
+    WHEEL_RELEASE_COOLDOWN, WHEEL_MAX_SPEED_LIMIT, WHEEL_RESET_THRESHOLD,
+    WHEEL_MIN_DX_GUARD, WHEEL_AFTER_SWIPE_COOLDOWN,
+    WHEEL_SWIPE_MIN_DURATION, WHEEL_SWIPE_ACCUM_TARGET,
+    WHEEL_MIN_EVENT_COUNT, WHEEL_VELOCITY_THRESHOLD,
+    SWIPE_THRESHOLD_X, HOTKEY_DEBOUNCE_SEC, HOTKEY_MONITOR_INTERVAL_MS,
     MAX_NUM_SHORTCUTS, MAX_FAVORITES, ZOOM_MIN_LIMIT, ZOOM_MAX_LIMIT,
 
     # 8. タイミング・遅延・しきい値
@@ -1308,9 +1311,9 @@ class ResidentMiniPlayer(QMainWindow):
     def _handle_wheel_event(self, event):
         current_time = time.time()
         
-        # --- 0. 基本ガード（継続） ---
-        release_cooldown = 0.15
-        if current_time - getattr(self, '_last_release_time', 0) < release_cooldown:
+        # --- 0. 基本ガード ---
+        # 指を離した直後、またはテキスト選択中（ボタン押下中）はガード
+        if current_time - getattr(self, '_last_release_time', 0) < WHEEL_RELEASE_COOLDOWN:
             return False
         if getattr(self, '_is_left_button_pressed', False):
             return False
@@ -1319,45 +1322,43 @@ class ResidentMiniPlayer(QMainWindow):
         dx = delta.x()
         dy = delta.y()
 
-        # --- 1. 状態のリセット ---
+        # --- 1. 状態のリセットロジック ---
         last_t = getattr(self, 'last_wheel_time', 0)
-        if current_time - last_t > 0.12: # 少しリセット判定を緩める
+        if current_time - last_t > WHEEL_RESET_THRESHOLD:
             self.swipe_start_time = current_time
             self.swipe_acc_x = 0
             self.event_count = 0
         self.last_wheel_time = current_time
 
         # --- 2. ノイズ・サイト内スクロール対策 ---
-        # 垂直移動の混入ガード
-        if abs(dy) > abs(dx):
+        # 垂直移動が強い、または1イベントの移動量が異常に大きい（スパイク）場合はリセット
+        if abs(dy) > abs(dx) or abs(dx) > WHEEL_MAX_SPEED_LIMIT:
             self.swipe_acc_x = 0
             return False
             
-        # 微細な動きを「遊び」として捨てる（感度を下げるポイント）
-        # 1回あたりの移動が小さすぎる（例: 3px以下）場合は、意図的なスワイプではないとみなす
-        if abs(dx) < 3: 
+        # 微小な動き（手ブレ等）を「遊び」として捨てる
+        if abs(dx) < WHEEL_MIN_DX_GUARD:
             return False
 
-        if (current_time * 1000) - getattr(self, 'last_swipe_time', 0) < 800: # クールダウンを少し伸ばす
+        # 実行後のクールダウン期間内なら無視
+        last_swipe_ms = getattr(self, 'last_swipe_time', 0)
+        if (current_time * 1000) - last_swipe_ms < WHEEL_AFTER_SWIPE_COOLDOWN:
             return False
 
         # --- 3. 蓄積 ---
         self.swipe_acc_x += dx
         self.event_count += 1
         
-        duration = current_time - self.swipe_start_time
+        duration = current_time - getattr(self, 'swipe_start_time', current_time)
 
-        # --- 4. 実行判定（加速度と密度の厳格化） ---
-        # 修正ポイント: 
-        # - 蓄積目標（WHEEL_SWIPE_ACCUM_TARGET）を達成していること
-        # - durationが短すぎず、かつイベント密度が十分であること
-        # - event_count の閾値を 25 -> 35 前後に引き上げ（より「しっかり」回さないと反応しない）
-        
-        if duration > 0.15 and abs(self.swipe_acc_x) > WHEEL_SWIPE_ACCUM_TARGET:
-            if self.event_count > 35: # ★ここを大きくすると感度が下がります
-                # 【さらにプロの工夫】初速判定（スワイプの勢い）
+        # --- 4. 実行判定（三段構え） ---
+        # 1. 継続時間と蓄積距離
+        if duration > WHEEL_SWIPE_MIN_DURATION and abs(self.swipe_acc_x) > WHEEL_SWIPE_ACCUM_TARGET:
+            # 2. イベント密度（しっかり回しているか）
+            if self.event_count > WHEEL_MIN_EVENT_COUNT:
+                # 3. 加速度（サイト内スクロールではない「鋭さ」があるか）
                 velocity = abs(self.swipe_acc_x) / duration
-                if velocity > 1000: # ★勢いがない（ゆっくりな）横スクロールは弾く
+                if velocity > WHEEL_VELOCITY_THRESHOLD:
                     if self.swipe_acc_x > 0:
                         self.browser.back()
                     else:
